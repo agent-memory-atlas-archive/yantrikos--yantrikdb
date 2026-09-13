@@ -1,0 +1,23 @@
+[package]
+name = "yantrikdb-tui"
+version = "0.22.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Terminal explorer for a YantrikDB store: namespaces, memories, search, claims, revision history, entities, tasks"
+repository = "https://github.com/yantrikos/yantrikdb"
+keywords = ["ai", "memory", "tui", "database"]
+categories = ["command-line-utilities", "database"]
+publish = false
+
+[[bin]]
+name = "yantrikdb-tui"
+path = "src/main.rs"
+
+[dependencies]
+yantrikdb = { path = "../yantrikdb-core", version = "0.22.0" }
+# Same version and features as the engine so exactly ONE SQLite is linked
+# (CONCURRENCY.md rule 9 is about a second library; this is the same one,
+# reached through `YantrikDB::conn()`).
+rusqlite = { version = "0.37", features = ["bundled"] }
+ratatui = "0.30"
+serde_json = "1"
