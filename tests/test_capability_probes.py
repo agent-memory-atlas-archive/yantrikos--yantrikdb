@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -29,6 +30,14 @@ from yantrikdb import YantrikDB
 
 def ts(day: str) -> float:
     return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
+
+def days_ago(n: float) -> float:
+    """Age-relative timestamp. The currency probes pin RELATIVE ages, not
+    calendar dates: a fixed date tests a moving regime (the 2026-09-01
+    fixture was 8 days old when it passed and 12.8 days old when it failed),
+    and the property under test is a function of age."""
+    return time.time() - n * 86400.0
 
 
 @pytest.fixture
@@ -49,19 +58,45 @@ def rids(hits):
 # ── currency / succession ───────────────────────────────────────────────
 
 
-def test_currency_survives_mmr_engagement(db):
-    """Three revisions of one value plus enough same-topic distractors that
-    the pool crosses ``min_pool_for_mmr = max(3*top_k, 20)``. MMR treats a
-    succession chain as near-duplicates; the CURRENT value must still be
-    the first hit (08-17 follow-up B, measured closed on 0.18.0)."""
-    db.record("The memory server runs yantrikdb 0.15.1.", created_at=ts("2026-08-10"))
-    db.record("The memory server runs yantrikdb 0.15.2.", created_at=ts("2026-08-17"))
-    current = db.record("The memory server runs yantrikdb 0.18.0.", created_at=ts("2026-09-01"))
+def _currency_chain(db, current_age_days: float):
+    """Three revisions of one value (22 and 15 days before the current one)
+    plus 40 same-topic distractors 12 days older than the current, so the
+    pool crosses ``min_pool_for_mmr = max(3*top_k, 20)``; returns the rid of
+    the CURRENT value. Ages are relative to now."""
+    a = current_age_days
+    db.record("The memory server runs yantrikdb 0.15.1.", created_at=days_ago(a + 22))
+    db.record("The memory server runs yantrikdb 0.15.2.", created_at=days_ago(a + 15))
+    current = db.record("The memory server runs yantrikdb 0.18.0.", created_at=days_ago(a))
     for i in range(40):
         db.record(
             f"Ops note {i}: the backup job for the memory server ran and rotated logs.",
-            created_at=ts("2026-08-20"),
+            created_at=days_ago(a + 12),
         )
+    return current
+
+
+def test_currency_survives_mmr_engagement(db):
+    """MMR treats a succession chain as near-duplicates; the CURRENT value
+    must still be the first hit (08-17 follow-up B, measured closed on
+    0.18.0). Pinned at the regime the fix was measured in: the current
+    record 8 days old, which is what the original 2026-09-01 fixture was
+    when this probe last passed on main (2026-09-09)."""
+    current = _currency_chain(db, current_age_days=8)
+    hits = db.recall(
+        query="which yantrikdb version does the memory server run", top_k=5, skip_reinforce=True
+    )
+    assert rids(hits)[0] == current, texts(hits)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="OPEN engine limitation, measured 2026-09-13: past ~12.5 days of age the "
+    "superseded value outranks the current one (0.15.2 first at 12.6, 13, 14, 20, 30, "
+    "60 days). Currency of a revision chain depends on recency; succession-aware "
+    "ranking is the fix. strict=True so this flips loudly when the engine improves.",
+)
+def test_currency_survives_mmr_engagement_after_thirty_days(db):
+    current = _currency_chain(db, current_age_days=30)
     hits = db.recall(
         query="which yantrikdb version does the memory server run", top_k=5, skip_reinforce=True
     )
