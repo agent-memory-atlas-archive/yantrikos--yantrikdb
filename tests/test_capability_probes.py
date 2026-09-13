@@ -59,10 +59,17 @@ def rids(hits):
 
 
 def _currency_chain(db, current_age_days: float):
-    """Three revisions of one value (22 and 15 days before the current one)
-    plus 40 same-topic distractors 12 days older than the current, so the
-    pool crosses ``min_pool_for_mmr = max(3*top_k, 20)``; returns the rid of
-    the CURRENT value. Ages are relative to now."""
+    """Three INDEPENDENT records stating successive values of one fact (22
+    and 15 days before the current one) plus 40 same-topic distractors 12
+    days older than the current, so the pool crosses
+    ``min_pool_for_mmr = max(3*top_k, 20)``; returns the rid of the CURRENT
+    value. Ages are relative to now.
+
+    What this probes: ranking the NEWEST of contradictory plain records - the
+    way an agent that records facts as it learns them produces a succession.
+    It is NOT an explicit revision chain (no ``correct()``, ``prior_rid`` or
+    supersedes link), so it says nothing about persisted revision-chain
+    traversal; that is a separate property with its own probes."""
     a = current_age_days
     db.record("The memory server runs yantrikdb 0.15.1.", created_at=days_ago(a + 22))
     db.record("The memory server runs yantrikdb 0.15.2.", created_at=days_ago(a + 15))
@@ -90,10 +97,12 @@ def test_currency_survives_mmr_engagement(db):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="OPEN engine limitation, measured 2026-09-13: past ~12.5 days of age the "
-    "superseded value outranks the current one (0.15.2 first at 12.6, 13, 14, 20, 30, "
-    "60 days). Currency of a revision chain depends on recency; succession-aware "
-    "ranking is the fix. strict=True so this flips loudly when the engine improves.",
+    "OLDER of contradictory plain records outranks the newest (0.15.2 first at 12.6, "
+    "13, 14, 20, 30, 60 days) - newest-of-contradictory ranking depends on recency; "
+    "succession-aware ranking is the fix. strict=True flips this loudly when the "
+    "engine improves; raises=AssertionError keeps DB/runtime failures loud too.",
 )
 def test_currency_survives_mmr_engagement_after_thirty_days(db):
     current = _currency_chain(db, current_age_days=30)
