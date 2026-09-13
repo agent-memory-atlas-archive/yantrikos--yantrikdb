@@ -7,13 +7,29 @@ and view tasks for a namespace.
 
 ## Export and run
 
+The exporter and page ship inside the installed package
+(`yantrikdb/atlas/`). One command exports ONE store and serves it locally:
+
 ```powershell
-python examples/memory_atlas/export_atlas.py --stores PATH_TO_STORES --out scratch/memory-atlas
+yantrikdb atlas PATH/TO/store.db --open
+```
+
+Only the named file is exported, never its sibling `.db` files; the export
+runs in a child process that opens the store read-only with the standard
+library's `sqlite3`, and the page is served from the export directory on
+127.0.0.1. From the MCP server the same export is the `atlas` tool ("show me
+my memory"). To export a whole directory of stores, or to run from a
+checkout without installing, use the packaged script directly (this
+`export_atlas.py` is a shim that runs it):
+
+```powershell
+python examples/memory_atlas/export_atlas.py --stores PATH_TO_STORES_OR_ONE_DB --out scratch/memory-atlas
 python -m http.server 8771 --bind 127.0.0.1 --directory scratch/memory-atlas
 ```
 
-Open http://127.0.0.1:8771. The input directory must contain `.db` files. No
-engine, embedding model, API key, or extra Python dependency is needed.
+`--stores` takes one `.db` file (exports only that store) or a directory
+(exports every `.db` in it). No engine, embedding model, API key, or extra
+Python dependency is needed.
 The page fetches only adjacent `data.json`; it has no external assets.
 Re-export and reload to refresh. This is a snapshot, not a live change feed.
 Use `--label "Fictional sample"` to add a visible provenance label when exporting
