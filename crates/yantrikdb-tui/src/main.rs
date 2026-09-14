@@ -81,9 +81,9 @@ struct App {
     status: String,
     /// The store the user named; never opened by the engine.
     source: PathBuf,
-    /// The private copy the engine is constructed on.
-    snapshot: PathBuf,
-    snapshot_seq: u32,
+    /// The private copy the engine is constructed on. Declared AFTER `db`
+    /// so the engine drops before the directory is removed.
+    snapshot: SnapshotGuard,
     snapshot_at: f64,
     search_state: SearchState,
     /// The namespace scope in force (set on Enter in the namespace pane),
@@ -103,27 +103,71 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Consistent copy of `source` via SQLite's online backup, read through a
-/// plain READ-ONLY connection of the engine's own library. Nothing in the
-/// source is modified: no journal switch, no migration, no backfill.
-fn take_snapshot(source: &Path, seq: u32) -> Result<PathBuf, Box<dyn Error>> {
-    // Unique per open within this process (two explorers, or two tests, on
-    // stores that share a file name must never share a snapshot file), and
-    // per process on disk.
-    static OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir()
-        .join("yantrikdb-tui")
-        .join(std::process::id().to_string());
-    std::fs::create_dir_all(&dir)?;
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("store");
-    let dest = dir.join(format!("{stem}-{n}-{seq}.db"));
-    if dest.exists() {
-        return Err(format!("snapshot path already exists: {}", dest.display()).into());
+/// A private, EXCLUSIVELY created directory that owns one snapshot copy.
+///
+/// Dropping the guard removes the directory, so a copy never outlives the
+/// explorer: on normal exit, on refresh, and on every error path of
+/// `take_snapshot`/`open_snapshot` (the guard is created first and any
+/// failure returns through it). The engine on the copy must be closed
+/// before the guard drops; `App` declares the engine before the guard so
+/// field-drop order does that on the panic path, and `App::close`/`refresh`
+/// do it explicitly.
+struct SnapshotGuard {
+    dir: PathBuf,
+}
+
+impl SnapshotGuard {
+    fn create() -> Result<Self, Box<dyn Error>> {
+        let root = std::env::temp_dir().join("yantrikdb-tui");
+        std::fs::create_dir_all(&root)?;
+        for _ in 0..16 {
+            // `create_dir` (not `create_dir_all`) is the exclusive step: it
+            // fails if the name exists, so a leftover from a crashed process
+            // or a concurrent explorer can never be reused.
+            let dir = root.join(format!(
+                "{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(SnapshotGuard { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err("could not create a private snapshot directory".into())
     }
+
+    fn db_path(&self) -> PathBuf {
+        self.dir.join("snapshot.db")
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        // Best effort with retries (up to ~2 s): on Windows the engine's file
+        // handles are released on the last reference drop, which can trail
+        // `close()` while its worker threads wind down. A process killed
+        // outright cannot run this; such leftovers carry the dead pid in
+        // their name and are never reused (names are random and created
+        // exclusively).
+        for attempt in 0..40 {
+            match std::fs::remove_dir_all(&self.dir) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 39 => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// Consistent copy of `source` via SQLite's online backup, read through a
+/// plain READ-ONLY connection of the engine's own library, into the guard's
+/// directory. Nothing in the source is modified: no journal switch, no
+/// migration, no backfill.
+fn take_snapshot(source: &Path, guard: &SnapshotGuard) -> Result<PathBuf, Box<dyn Error>> {
+    let dest = guard.db_path();
     let src = rusqlite::Connection::open_with_flags(
         source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -131,7 +175,15 @@ fn take_snapshot(source: &Path, seq: u32) -> Result<PathBuf, Box<dyn Error>> {
     let mut dst = rusqlite::Connection::open(&dest)?;
     {
         let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
-        backup.run_to_completion(256, Duration::from_millis(5), None)?;
+        // ALL pages in ONE step. A paged backup is restarted by SQLite each
+        // time another connection commits to the source between steps, so
+        // against a busy writer it never finishes; a single step copies the
+        // whole file under one read transaction (WAL readers block nobody)
+        // and yields exactly one moment in time.
+        match backup.step(-1)? {
+            rusqlite::backup::StepResult::Done => {}
+            other => return Err(format!("snapshot did not complete in one step: {other:?}").into()),
+        }
     }
     dst.close().map_err(|(_, e)| e)?;
     src.close().map_err(|(_, e)| e)?;
@@ -139,15 +191,14 @@ fn take_snapshot(source: &Path, seq: u32) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 /// Snapshot, then construct the engine on the copy and attach the store's
-/// recorded embedder.
-fn open_snapshot(
-    source: &Path,
-    seq: u32,
-) -> Result<(YantrikDB, PathBuf, SearchState), Box<dyn Error>> {
-    let snapshot = take_snapshot(source, seq)?;
-    let mut db = YantrikDB::with_default(&snapshot.to_string_lossy())?;
+/// recorded embedder. Any failure returns through the guard, which removes
+/// whatever was copied.
+fn open_snapshot(source: &Path) -> Result<(YantrikDB, SnapshotGuard, SearchState), Box<dyn Error>> {
+    let guard = SnapshotGuard::create()?;
+    let copy = take_snapshot(source, &guard)?;
+    let mut db = YantrikDB::with_default(&copy.to_string_lossy())?;
     let search_state = attach_store_embedder(&mut db);
-    Ok((db, snapshot, search_state))
+    Ok((db, guard, search_state))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -171,7 +222,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
-    result
+    // Close the engine, then drop the snapshot directory, whatever `run` did.
+    let closed = app.close();
+    result.and(closed)
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(), Box<dyn Error>> {
@@ -321,7 +374,7 @@ fn next_pane(p: Pane, forward: bool) -> Pane {
 impl App {
     /// Snapshot `source` and build the explorer on the copy.
     fn open(source: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let (db, snapshot, search_state) = open_snapshot(&source, 1)?;
+        let (db, snapshot, search_state) = open_snapshot(&source)?;
         let mut app = App {
             db,
             store: source.display().to_string(),
@@ -341,7 +394,6 @@ impl App {
             status: String::new(),
             source,
             snapshot,
-            snapshot_seq: 1,
             snapshot_at: now_secs(),
             search_state,
             scope: None,
@@ -402,6 +454,16 @@ impl App {
         } else {
             self.namespaces.get(i).map(|(n, _)| n.clone())
         }
+    }
+
+    /// Close the engine, then drop the snapshot directory. Field-drop order
+    /// gives the same sequence on the panic path; this makes it explicit
+    /// and reports a close failure.
+    fn close(self) -> Result<(), Box<dyn Error>> {
+        let App { db, snapshot, .. } = self;
+        db.close()?;
+        drop(snapshot);
+        Ok(())
     }
 
     fn header_note(&self) -> String {
@@ -535,14 +597,13 @@ impl App {
     /// keeping the namespace scope by NAME (a namespace that has vanished
     /// falls back to all).
     fn refresh(&mut self) {
-        let seq = self.snapshot_seq + 1;
-        match open_snapshot(&self.source, seq) {
-            Ok((db, snapshot, search_state)) => {
-                let old = std::mem::replace(&mut self.db, db);
-                let _ = old.close();
-                let _ = std::fs::remove_file(&self.snapshot);
-                self.snapshot = snapshot;
-                self.snapshot_seq = seq;
+        match open_snapshot(&self.source) {
+            Ok((db, guard, search_state)) => {
+                // Close the old engine BEFORE its directory goes away.
+                let old_db = std::mem::replace(&mut self.db, db);
+                let _ = old_db.close();
+                let old_guard = std::mem::replace(&mut self.snapshot, guard);
+                drop(old_guard);
                 self.snapshot_at = now_secs();
                 self.search_state = search_state;
             }
@@ -1011,21 +1072,30 @@ mod tests {
         .unwrap()
     }
 
+    /// Record one memory, honouring the engine's typed backpressure (the
+    /// delta queue is finite; a tight loop meets it) the way a client would.
     fn record(db: &YantrikDB, ns: &str, text: &str) -> String {
-        db.record_text(
-            text,
-            "semantic",
-            0.6,
-            0.0,
-            604800.0,
-            &serde_json::json!({}),
-            ns,
-            0.8,
-            "general",
-            "user",
-            None,
-        )
-        .unwrap()
+        loop {
+            match db.record_text(
+                text,
+                "semantic",
+                0.6,
+                0.0,
+                604800.0,
+                &serde_json::json!({}),
+                ns,
+                0.8,
+                "general",
+                "user",
+                None,
+            ) {
+                Ok(rid) => return rid,
+                Err(yantrikdb::YantrikDbError::Backpressure { retry_after_ms, .. }) => {
+                    std::thread::sleep(Duration::from_millis(retry_after_ms));
+                }
+                Err(e) => panic!("record failed: {e}"),
+            }
+        }
     }
 
     /// Build the SOURCE with a writer engine and close it: two namespaces,
@@ -1112,7 +1182,11 @@ mod tests {
     #[test]
     fn app_lists_namespaces_memories_and_inspects_without_a_terminal() {
         let (mut app, dana, source) = seeded("lists");
-        assert_ne!(app.snapshot, source, "the engine runs on a private copy");
+        assert_ne!(
+            app.snapshot.db_path(),
+            source,
+            "the engine runs on a private copy"
+        );
         assert!(
             matches!(app.search_state, SearchState::Ready(_)),
             "{}",
@@ -1158,6 +1232,7 @@ mod tests {
         assert_eq!(ins.revisions.len(), 1);
         assert!(ins.revisions[0].contains("importance bump"));
         assert!(ins.header.len() >= 3);
+        app.close().unwrap();
     }
 
     #[test]
@@ -1179,6 +1254,7 @@ mod tests {
         app.load_page(0);
         assert!(app.memories.iter().all(|m| m.score.is_none()));
         assert_eq!(app.memories.len(), 3);
+        app.close().unwrap();
     }
 
     #[test]
@@ -1208,14 +1284,20 @@ mod tests {
             "source schema stamp untouched"
         );
         assert_eq!(app.total, 3);
-        let copy_version: i64 = meta_value(&app.snapshot, "schema_version").parse().unwrap();
+        let copy_version: i64 = meta_value(&app.snapshot.db_path(), "schema_version")
+            .parse()
+            .unwrap();
         assert!(copy_version > 40, "the COPY is migrated; the source is not");
-        drop(app);
+        app.close().unwrap();
         assert_eq!(source_state(&path), before, "still untouched after close");
     }
 
+    /// OPEN-WRITER / WAL snapshot: a writer engine holds the source open (its
+    /// rows live in the WAL) while the explorer snapshots it. Writes here
+    /// happen before and after the backup, not during it; the concurrent case
+    /// is the next test.
     #[test]
-    fn snapshot_under_an_active_writer_is_a_moment_in_time_and_the_writer_continues() {
+    fn snapshot_with_an_open_writer_is_a_moment_in_time_and_the_writer_continues() {
         let path = temp_dir("writer").join("source.db");
         let w = writer(&path);
         for i in 0..12 {
@@ -1225,8 +1307,6 @@ mod tests {
                 &format!("Nightly run {i} completed with no failures."),
             );
         }
-        // Snapshot while the writer holds the source open (same library, same
-        // process: one plain read-only connection alongside the engine's).
         let mut app = App::open(path.clone()).unwrap();
         assert_eq!(app.total, 12);
         for i in 12..18 {
@@ -1237,7 +1317,96 @@ mod tests {
         assert_eq!(app.total, 18, "refresh takes a new snapshot");
         assert!(app.namespaces.iter().any(|(n, _)| n == "ops"));
         record(&w, "work", "The writer is undisturbed by the explorer.");
+        app.close().unwrap();
         w.close().unwrap();
+    }
+
+    /// CONCURRENT writer: a background thread keeps committing rows while
+    /// the backups run. Every snapshot must be a valid store whose count
+    /// lies between what was committed before and after.
+    #[test]
+    fn snapshot_while_a_background_writer_commits_is_consistent() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let path = temp_dir("concurrent").join("source.db");
+        let w = writer(&path);
+        for i in 0..20 {
+            record(&w, "work", &format!("Seed row {i}."));
+        }
+        let stop = AtomicBool::new(false);
+        let written = AtomicUsize::new(20);
+        let mut apps: Vec<App> = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Commit steadily, just under the engine's backpressure limit:
+                // the point is commits DURING the backups, not saturating the
+                // engine (a saturated single writer occasionally wedges inside
+                // the engine, which is an engine finding, not this test's).
+                let mut i = 20;
+                while !stop.load(Ordering::Relaxed) {
+                    match w.record_text(
+                        &format!("Concurrent row {i}."),
+                        "semantic",
+                        0.6,
+                        0.0,
+                        604800.0,
+                        &serde_json::json!({}),
+                        "work",
+                        0.8,
+                        "general",
+                        "user",
+                        None,
+                    ) {
+                        Ok(_) => {
+                            written.fetch_add(1, Ordering::Relaxed);
+                            i += 1;
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(yantrikdb::YantrikDbError::Backpressure { retry_after_ms, .. }) => {
+                            std::thread::sleep(Duration::from_millis(retry_after_ms));
+                        }
+                        Err(e) => panic!("writer failed: {e}"),
+                    }
+                }
+            });
+            for k in 0..3 {
+                eprintln!(
+                    "[concurrent] opening snapshot {k} (written so far {})",
+                    written.load(Ordering::Relaxed)
+                );
+                apps.push(App::open(path.clone()).unwrap());
+                eprintln!("[concurrent] opened snapshot {k}: total {}", apps[k].total);
+            }
+            stop.store(true, Ordering::Relaxed);
+            eprintln!("[concurrent] stop set; waiting for the writer thread");
+        });
+        eprintln!("[concurrent] writer thread joined");
+        let after = written.load(Ordering::Relaxed);
+        assert!(
+            after > 20,
+            "the writer committed during the backups ({after})"
+        );
+        for app in &apps {
+            assert!(
+                app.total >= 20 && app.total <= after,
+                "snapshot count {} within [20, {after}]",
+                app.total
+            );
+            assert_eq!(app.namespaces[0].1 as usize, app.total, "a consistent copy");
+        }
+        let mut app = apps.pop().unwrap();
+        app.open_selected();
+        assert!(app.inspector.is_some(), "the copy is a working store");
+        eprintln!("[concurrent] assertions passed; closing snapshot engines");
+        for (k, app) in apps.into_iter().enumerate() {
+            app.close().unwrap();
+            eprintln!("[concurrent] closed snapshot engine {k}");
+        }
+        app.close().unwrap();
+        eprintln!("[concurrent] closed last snapshot engine; final write");
+        record(&w, "work", "The writer is undisturbed by the explorer.");
+        eprintln!("[concurrent] closing the writer");
+        w.close().unwrap();
+        eprintln!("[concurrent] writer closed");
     }
 
     #[test]
@@ -1263,7 +1432,12 @@ mod tests {
             .unwrap();
         w.close().unwrap();
 
+        let first_dir = app.snapshot.dir.clone();
         app.refresh();
+        assert!(
+            !first_dir.exists(),
+            "the previous snapshot directory is removed on refresh"
+        );
         assert_eq!(
             app.scope.as_deref(),
             Some("work"),
@@ -1283,6 +1457,53 @@ mod tests {
             "{:?}",
             app.namespaces
         );
+        app.close().unwrap();
+    }
+
+    #[test]
+    fn closing_removes_the_snapshot_directory() {
+        let (app, _, _) = seeded("cleanup");
+        let dir = app.snapshot.dir.clone();
+        assert!(dir.join("snapshot.db").is_file());
+        app.close().unwrap();
+        assert!(!dir.exists(), "snapshot directory removed on close");
+    }
+
+    #[test]
+    fn a_failed_snapshot_leaves_nothing_behind() {
+        // Backup from a missing source.
+        let guard = SnapshotGuard::create().unwrap();
+        let dir = guard.dir.clone();
+        assert!(take_snapshot(&temp_dir("missing").join("does-not-exist.db"), &guard).is_err());
+        drop(guard);
+        assert!(!dir.exists(), "directory removed after a failed backup");
+
+        // Backup from a file that is not a database.
+        let bogus = temp_dir("bogus").join("not-a-db.db");
+        std::fs::write(&bogus, b"not a database").unwrap();
+        let guard = SnapshotGuard::create().unwrap();
+        let dir = guard.dir.clone();
+        assert!(take_snapshot(&bogus, &guard).is_err());
+        drop(guard);
+        assert!(
+            !dir.exists(),
+            "directory removed after a failed backup of a non-database"
+        );
+
+        // The whole open path: nothing left behind either.
+        assert!(open_snapshot(&bogus).is_err());
+    }
+
+    #[test]
+    fn snapshot_directories_are_created_exclusively() {
+        let a = SnapshotGuard::create().unwrap();
+        let b = SnapshotGuard::create().unwrap();
+        assert_ne!(a.dir, b.dir);
+        assert!(a.dir.is_dir() && b.dir.is_dir());
+        let (da, db_) = (a.dir.clone(), b.dir.clone());
+        drop(a);
+        drop(b);
+        assert!(!da.exists() && !db_.exists());
     }
 
     /// Manual smoke against a real store, when one is named:
@@ -1317,5 +1538,6 @@ mod tests {
             }
         }
         assert!(!app.namespaces.is_empty());
+        app.close().unwrap();
     }
 }

@@ -24,3 +24,5 @@ yantrikdb = { path = "../yantrikdb-core", version = "0.22.0", features = ["embed
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 ratatui = "0.30"
 serde_json = "1"
+# Random suffix for the exclusively-created snapshot directory.
+rand = { version = "0.8", features = ["small_rng"] }
