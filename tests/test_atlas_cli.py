@@ -84,3 +84,32 @@ def test_packaged_exporter_is_invoked_as_a_script(monkeypatch, tmp_path):
     assert cmd[0] == sys.executable and "-m" not in cmd
     assert cmd[1].endswith("export_atlas.py") and Path(cmd[1]).is_file()
     assert cmd[cmd.index("--stores") + 1] == str(db.resolve())
+
+
+def test_out_dir_equal_to_the_store_directory_is_refused(tmp_path):
+    """The server would otherwise serve the store and its neighbours."""
+    db = _fixture(tmp_path)
+    r = CliRunner().invoke(cli, ["atlas", str(db), "--out", str(tmp_path), "--no-serve"])
+    assert r.exit_code != 0
+    assert "store's own directory" in r.output
+    assert not (tmp_path / "data.json").exists()
+
+
+def test_existing_non_atlas_directory_is_refused(tmp_path):
+    db = _fixture(tmp_path)
+    other = tmp_path / "docs"
+    other.mkdir()
+    (other / "index.html").write_text("someone else's page", encoding="utf-8")
+    r = CliRunner().invoke(cli, ["atlas", str(db), "--out", str(other), "--no-serve"])
+    assert r.exit_code != 0 and "not an atlas export directory" in r.output
+    assert (other / "index.html").read_text(encoding="utf-8") == "someone else's page"
+
+
+def test_encrypted_store_is_refused_with_a_plain_message(tmp_path):
+    from yantrikdb import YantrikDB
+
+    enc = tmp_path / "secret.db"
+    YantrikDB(str(enc), encryption_key=bytes(range(32))).close()
+    r = CliRunner().invoke(cli, ["atlas", str(enc), "--out", str(tmp_path / "s"), "--no-serve"])
+    assert r.exit_code != 0
+    assert "encrypted" in r.output and "Traceback" not in r.output

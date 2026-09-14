@@ -2,6 +2,7 @@
 //! explorer needs and could previously get only from raw SQL.
 
 use super::*;
+#[cfg(feature = "bundled-embedder")]
 use crate::{StatedClaim, STATED_CLAIM_EXTRACTOR};
 
 fn test_key() -> [u8; 32] {
@@ -104,6 +105,7 @@ fn revision_history_decrypts_prior_state_on_encrypted_stores() {
 
 // ── claims_for_memory ───────────────────────────────────────────────
 
+#[cfg(feature = "bundled-embedder")]
 fn claim(src: &str, rel: &str, dst: &str) -> StatedClaim {
     StatedClaim {
         src: src.into(),
@@ -115,6 +117,7 @@ fn claim(src: &str, rel: &str, dst: &str) -> StatedClaim {
     }
 }
 
+#[cfg(feature = "bundled-embedder")]
 #[test]
 fn claims_for_memory_returns_the_memory_s_stated_claims_with_status() {
     let db = YantrikDB::with_default(":memory:").unwrap();
@@ -182,6 +185,7 @@ fn claims_for_memory_returns_the_memory_s_stated_claims_with_status() {
     assert!(db.claims_for_memory("no-such-rid").unwrap().is_empty());
 }
 
+#[cfg(feature = "bundled-embedder")]
 #[test]
 fn claims_for_memory_marks_a_denied_claim_negative() {
     let db = YantrikDB::with_default(":memory:").unwrap();

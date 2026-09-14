@@ -46,6 +46,16 @@ def export(stores, out, label=None):
         conn.execute('PRAGMA query_only=ON')
         conn.execute('BEGIN')
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+        # Encrypted stores archive text and metadata as ciphertext; this exporter
+        # reads raw rows and cannot decrypt, so it refuses rather than emit a
+        # ciphertext dashboard. An explicitly keyed engine-side snapshot path is
+        # the way to support them later.
+        if 'meta' in tables:
+            flag = conn.execute("SELECT value FROM meta WHERE key = 'encryption_enabled'").fetchone()
+            if flag and str(flag[0]) == '1':
+                conn.close()  # release the file before raising (Windows keeps it locked otherwise)
+                raise ValueError(f'{path.name} is encrypted: the atlas exporter reads raw rows and cannot '
+                                 'decrypt; exporting encrypted stores is not supported yet')
         local = {}
         group_ids = {}
         def columns(table):

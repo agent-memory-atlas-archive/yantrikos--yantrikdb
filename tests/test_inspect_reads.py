@@ -22,6 +22,12 @@ from yantrikdb import YantrikDB
 _EXPORTER = Path(__file__).resolve().parents[1] / "src" / "yantrikdb" / "atlas" / "export_atlas.py"
 
 
+def test_binding_registers_the_three_reads():
+    """Source-build CI must fail, not skip, if a registration goes missing."""
+    for name in ("claims_for_memory", "revision_history", "memory_entities"):
+        assert callable(getattr(YantrikDB, name, None)), f"binding lacks {name}"
+
+
 @pytest.fixture
 def db(tmp_path):
     store = YantrikDB.with_default(str(tmp_path / "inspect.db"))
@@ -29,14 +35,7 @@ def db(tmp_path):
     store.close()
 
 
-def _skip_unless_present():
-    for name in ("claims_for_memory", "revision_history", "memory_entities"):
-        if not hasattr(YantrikDB, name):
-            pytest.skip(f"binding lacks {name}")
-
-
 def test_revision_history_returns_prior_states_oldest_first(db):
-    _skip_unless_present()
     rid = db.record("Dana leads the Data Platform team.", metadata={"team": "data"})
     assert db.revision_history(rid) == []
     before = time.time()
@@ -56,7 +55,6 @@ def test_revision_history_returns_prior_states_oldest_first(db):
 
 
 def test_claims_for_memory_returns_the_memory_s_claims(db):
-    _skip_unless_present()
     rid = db.record("Pranab prefers Vim for editing Rust and reviews with Maria.")
     other = db.record("Unrelated note about the weather in Lisbon.")
     report = db.attach_claims(rid, [
@@ -74,7 +72,6 @@ def test_claims_for_memory_returns_the_memory_s_claims(db):
 
 
 def test_memory_entities_lists_linked_names_sorted(db):
-    _skip_unless_present()
     rid = db.record("A plain record with no obvious names in it.")
     db.link_memory_entity(rid, "Zeta Corp")
     db.link_memory_entity(rid, "Acme")
@@ -87,7 +84,6 @@ def test_binding_reads_agree_with_the_atlas_exporter(tmp_path):
     """The use: the exporter reads claims, revisions and memberships from
     the file with raw SQL in a child process; the binding reads them in the
     engine's process. Same store, same memory, same answers."""
-    _skip_unless_present()
     path = tmp_path / "agree.db"
     db = YantrikDB.with_default(str(path))
     rid = db.record("Dana Okafor leads the Data Platform team at Northwind Analytics.")

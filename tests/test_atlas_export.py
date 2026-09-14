@@ -74,4 +74,15 @@ class ExportTests(unittest.TestCase):
             self.assertTrue(all(g['name'].startswith('sample /') for g in d['groups']))
             with self.assertRaises(ValueError): export(stores/'notes.txt',base/'site2')
 
+    def test_encrypted_store_is_refused_not_exported_as_ciphertext(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp); c,stores=self.fixture(base)
+            c.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+            c.execute("INSERT INTO meta VALUES ('encryption_enabled','1')")
+            c.commit(); c.close()
+            with self.assertRaises(ValueError) as ctx:
+                with contextlib.redirect_stdout(io.StringIO()): export(stores,base/'site')
+            self.assertIn('encrypted', str(ctx.exception))
+            self.assertFalse((base/'site/data.json').exists())
+
 if __name__=='__main__': unittest.main()

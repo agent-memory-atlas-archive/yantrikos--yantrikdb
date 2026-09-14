@@ -671,15 +671,22 @@ def atlas(db_path, out_dir, label, serve, port, open_browser):
     """
     import subprocess
 
+    from yantrikdb.atlas.serve import atlas_out_dir, serve_export
+
     store = Path(db_path).resolve()
-    out = Path(out_dir).resolve() if out_dir else store.with_name(store.name + ".atlas")
+    try:
+        out = atlas_out_dir(Path(out_dir) if out_dir else store.with_name(store.name + ".atlas"), store)
+    except ValueError as e:
+        raise click.UsageError(str(e))
     script = Path(__file__).with_name("atlas") / "export_atlas.py"
     cmd = [sys.executable, str(script), "--stores", str(store), "--out", str(out)]
     if label:
         cmd += ["--label", label]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        click.echo((proc.stderr or proc.stdout).strip(), err=True)
+        # The exporter's own message (e.g. "is encrypted"), never a traceback.
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        click.echo(err[-1] if err else "atlas export failed", err=True)
         sys.exit(proc.returncode or 1)
     if proc.stdout.strip():
         click.echo(proc.stdout.strip(), err=True)
@@ -687,13 +694,10 @@ def atlas(db_path, out_dir, label, serve, port, open_browser):
     if not serve:
         return
 
-    from functools import partial
-    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-
-    # Serves ONLY the export directory, never the store's directory.
-    handler = partial(SimpleHTTPRequestHandler, directory=str(out))
-    with ThreadingHTTPServer(("127.0.0.1", port), handler) as httpd:
-        url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    # Serves exactly index.html, data.json and export-report.json from the
+    # export directory; no listings, no neighbours, no symlink escapes.
+    httpd, url = serve_export(out, port)
+    with httpd:
         click.echo(f"Serving {out} at {url} (Ctrl-C to stop)", err=True)
         if open_browser:
             import webbrowser
