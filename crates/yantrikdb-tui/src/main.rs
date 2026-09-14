@@ -5,19 +5,23 @@
 //! text, metadata, linked entities, the claims it backs, and its revision
 //! history; the namespace's tasks sit under the inspector.
 //!
-//! READ-ONLY BY CONSTRUCTION. Every read goes through the engine's own
-//! non-reinforcing paths (`recall(.., skip_reinforce = true, ..)`,
-//! `list_memories`, `get`, the `engine::inspect` reads), so opening a store
-//! here leaves no access-count trace and writes nothing. The store is
-//! opened with the engine's own SQLite in this process; a live agent in
-//! ANOTHER process is fine (CONCURRENCY.md rule 9: separate processes are
-//! serialised by the kernel; the rule forbids a second SQLite *library in
-//! one process*, which this is not).
+//! THE SOURCE IS NEVER OPENED BY THE ENGINE. An ordinary engine open is not
+//! read-only: it switches the journal to WAL, runs schema migrations and
+//! entity/source-turn backfills, and may rewrite oplog payloads. So the
+//! explorer takes a consistent SNAPSHOT first — a plain read-only connection
+//! of the engine's own SQLite library runs the online backup into a private
+//! temporary file — and constructs the engine on that copy. The source's
+//! bytes, journal mode and schema stamp are untouched, an agent writing to it
+//! from another process is undisturbed, and `r` takes a fresh snapshot.
 //!
-//! Zero model calls: search embeds the query with the bundled embedder the
-//! store already uses.
+//! On the snapshot every read goes through non-reinforcing paths
+//! (`recall(.., skip_reinforce = true, ..)`, `list_memories`, `get`, the
+//! `engine::inspect` reads). Search embeds queries with the model the store
+//! recorded, verified by digest; if that model cannot be attached, search is
+//! disabled and the status line says why.
 
 use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -75,6 +79,75 @@ struct App {
     tasks: Vec<String>,
     pane: Pane,
     status: String,
+    /// The store the user named; never opened by the engine.
+    source: PathBuf,
+    /// The private copy the engine is constructed on.
+    snapshot: PathBuf,
+    snapshot_seq: u32,
+    snapshot_at: f64,
+    search_state: SearchState,
+    /// The namespace scope in force (set on Enter in the namespace pane),
+    /// kept BY NAME so a refresh cannot silently move it.
+    scope: Option<String>,
+}
+
+enum SearchState {
+    Ready(String),
+    Disabled(String),
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Consistent copy of `source` via SQLite's online backup, read through a
+/// plain READ-ONLY connection of the engine's own library. Nothing in the
+/// source is modified: no journal switch, no migration, no backfill.
+fn take_snapshot(source: &Path, seq: u32) -> Result<PathBuf, Box<dyn Error>> {
+    // Unique per open within this process (two explorers, or two tests, on
+    // stores that share a file name must never share a snapshot file), and
+    // per process on disk.
+    static OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join("yantrikdb-tui")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&dir)?;
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("store");
+    let dest = dir.join(format!("{stem}-{n}-{seq}.db"));
+    if dest.exists() {
+        return Err(format!("snapshot path already exists: {}", dest.display()).into());
+    }
+    let src = rusqlite::Connection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut dst = rusqlite::Connection::open(&dest)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
+        backup.run_to_completion(256, Duration::from_millis(5), None)?;
+    }
+    dst.close().map_err(|(_, e)| e)?;
+    src.close().map_err(|(_, e)| e)?;
+    Ok(dest)
+}
+
+/// Snapshot, then construct the engine on the copy and attach the store's
+/// recorded embedder.
+fn open_snapshot(
+    source: &Path,
+    seq: u32,
+) -> Result<(YantrikDB, PathBuf, SearchState), Box<dyn Error>> {
+    let snapshot = take_snapshot(source, seq)?;
+    let mut db = YantrikDB::with_default(&snapshot.to_string_lossy())?;
+    let search_state = attach_store_embedder(&mut db);
+    Ok((db, snapshot, search_state))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -93,10 +166,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("no store file at {store}");
         std::process::exit(2);
     }
-    let mut db = YantrikDB::with_default(&store)?;
-    let embedder_note = attach_store_embedder(&mut db);
-    let mut app = App::new(db, store)?;
-    app.status = format!("{} · {embedder_note}", app.status);
+    let mut app = App::open(PathBuf::from(store))?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
@@ -177,30 +247,66 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(), Box
 }
 
 /// Search must embed queries with the SAME model that built the store's
-/// vectors. `with_default` opens an existing store at its recorded
-/// dimension but attaches only the bundled embedder; a store written with
-/// a named model (the default for new stores is potion-base-8M, 256-d)
-/// records that identity in `meta`, so attach it by name. Returns a note
-/// for the status line; on failure search still runs but is degraded, and
-/// the note says so rather than pretending.
-fn attach_store_embedder(db: &mut YantrikDB) -> String {
+/// vectors, and a matching dimension does not prove that. The store records
+/// its embedder's name, digest and dimension; `adopt_embedder_identity`
+/// compares the attached embedder's digest with the recorded one and
+/// returns Ok only on a match (it never persists when an identity is
+/// already recorded, and it is only called then). So: verify the attached
+/// embedder; if it differs, attach the recorded model by name and verify
+/// again; anything short of a verified match DISABLES search with the
+/// reason, rather than serving a differently-spaced similarity as if it
+/// were degraded-but-comparable.
+fn attach_store_embedder(db: &mut YantrikDB) -> SearchState {
+    let verify = |db: &YantrikDB| {
+        db.adopt_embedder_identity()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    // Capture the recorded identity BEFORE touching the embedder, and check
+    // afterwards that attaching/verifying did not rewrite it: a verification
+    // that reads back a record it just replaced would prove nothing.
+    let recorded = match db.embedder_identity() {
+        Ok(v) => v,
+        Err(e) => {
+            return SearchState::Disabled(format!(
+                "search disabled: embedder identity unreadable: {e}"
+            ))
+        }
+    };
+    let Some((name, digest, dim)) = recorded else {
+        return SearchState::Ready(
+            "no recorded embedder identity · engine default attached, unverified".to_string(),
+        );
+    };
+    let label = name.clone().unwrap_or_else(|| "bundled".to_string());
+    let outcome = if verify(db).is_ok() {
+        SearchState::Ready(format!("embedder {label} · {dim}-d · verified"))
+    } else if let Some(n) = name {
+        match db.set_embedder_named(&n) {
+            Err(e) => SearchState::Disabled(format!(
+                "search disabled: store needs embedder {n} ({dim}-d), which could not be \
+                 attached: {e}"
+            )),
+            Ok(()) => match verify(db) {
+                Ok(()) => SearchState::Ready(format!("embedder {n} · {dim}-d · verified")),
+                Err(e) => SearchState::Disabled(format!(
+                    "search disabled: {n} attached but its digest differs from the store's: {e}"
+                )),
+            },
+        }
+    } else {
+        SearchState::Disabled(format!(
+            "search disabled: the store's embedder is unnamed ({digest}, {dim}-d) and is \
+             not the one attached"
+        ))
+    };
+    // The record must be exactly what we started from.
     match db.embedder_identity() {
-        Ok(Some((Some(name), _digest, dim)))
-            if dim != yantrikdb::embedder::BUNDLED_EMBEDDER_DIM =>
-        {
-            match db.set_embedder_named(&name) {
-                Ok(()) => format!("embedder {name} · {dim}-d"),
-                Err(e) => format!("search degraded: store needs embedder {name} ({dim}-d): {e}"),
-            }
-        }
-        Ok(Some((name, _digest, dim))) => {
-            format!(
-                "embedder {} · {dim}-d",
-                name.unwrap_or_else(|| "bundled".to_string())
-            )
-        }
-        Ok(None) => "no recorded embedder identity; engine default attached".to_string(),
-        Err(e) => format!("embedder identity unreadable: {e}"),
+        Ok(Some((_, d2, dim2))) if d2 == digest && dim2 == dim => outcome,
+        other => SearchState::Disabled(format!(
+            "search disabled: the recorded embedder identity changed while attaching \
+             (was {digest}/{dim}-d, now {other:?})"
+        )),
     }
 }
 
@@ -213,10 +319,12 @@ fn next_pane(p: Pane, forward: bool) -> Pane {
 }
 
 impl App {
-    fn new(db: YantrikDB, store: String) -> Result<Self, Box<dyn Error>> {
+    /// Snapshot `source` and build the explorer on the copy.
+    fn open(source: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let (db, snapshot, search_state) = open_snapshot(&source, 1)?;
         let mut app = App {
             db,
-            store,
+            store: source.display().to_string(),
             namespaces: Vec::new(),
             ns_state: ListState::default(),
             memories: Vec::new(),
@@ -231,6 +339,12 @@ impl App {
             tasks: Vec::new(),
             pane: Pane::Memories,
             status: String::new(),
+            source,
+            snapshot,
+            snapshot_seq: 1,
+            snapshot_at: now_secs(),
+            search_state,
+            scope: None,
         };
         app.load_namespaces()?;
         app.ns_state.select(Some(0));
@@ -239,37 +353,62 @@ impl App {
         Ok(app)
     }
 
-    /// "All" first, then every namespace with a live (non-tombstoned)
-    /// memory count. Read through the engine's own connection: same
-    /// library, same process, no second SQLite.
+    /// "(all)" first, then every namespace: those with live (non-tombstoned)
+    /// memories carry their count, and namespaces that only hold tasks are
+    /// listed with 0, so the list is complete. Read through the engine's own
+    /// connection on the SNAPSHOT: same library, same process.
     fn load_namespaces(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut rows: Vec<(String, i64)> = Vec::new();
+        let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
         {
             let conn = self.db.conn();
             let mut stmt = conn.prepare(
                 "SELECT namespace, COUNT(*) FROM memories \
                  WHERE COALESCE(consolidation_status, 'active') != 'tombstoned' \
-                 GROUP BY namespace ORDER BY namespace",
+                 GROUP BY namespace",
             )?;
-            let it = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in it {
-                rows.push(row?);
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+                let (name, n) = row?;
+                counts.insert(name, n);
+            }
+            let has_tasks: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_tasks > 0 {
+                let mut stmt = conn.prepare("SELECT DISTINCT namespace FROM tasks")?;
+                for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                    counts.entry(row?).or_insert(0);
+                }
             }
         }
-        let all: i64 = rows.iter().map(|(_, n)| n).sum();
+        let all: i64 = counts.values().sum();
         self.namespaces = std::iter::once(("(all)".to_string(), all))
-            .chain(rows)
+            .chain(counts)
             .collect();
         Ok(())
     }
 
+    /// The scope in force: `None` is every namespace.
     fn selected_namespace(&self) -> Option<String> {
+        self.scope.clone()
+    }
+
+    /// The namespace under the cursor in the namespace pane.
+    fn namespace_at_cursor(&self) -> Option<String> {
         let i = self.ns_state.selected().unwrap_or(0);
         if i == 0 {
             None
         } else {
             self.namespaces.get(i).map(|(n, _)| n.clone())
         }
+    }
+
+    fn header_note(&self) -> String {
+        let search = match &self.search_state {
+            SearchState::Ready(note) | SearchState::Disabled(note) => note.as_str(),
+        };
+        format!("snapshot {} · {search}", fmt_clock(self.snapshot_at))
     }
 
     fn load_page(&mut self, page: usize) {
@@ -320,6 +459,11 @@ impl App {
         let q = self.query.trim().to_string();
         if q.is_empty() {
             self.load_page(0);
+            return;
+        }
+        if let SearchState::Disabled(reason) = &self.search_state {
+            self.status = reason.clone();
+            self.query.clear();
             return;
         }
         let ns = self.selected_namespace();
@@ -387,13 +531,37 @@ impl App {
         };
     }
 
+    /// Take a fresh snapshot of the source and rebuild every view on it,
+    /// keeping the namespace scope by NAME (a namespace that has vanished
+    /// falls back to all).
     fn refresh(&mut self) {
-        let keep_ns = self.ns_state.selected();
+        let seq = self.snapshot_seq + 1;
+        match open_snapshot(&self.source, seq) {
+            Ok((db, snapshot, search_state)) => {
+                let old = std::mem::replace(&mut self.db, db);
+                let _ = old.close();
+                let _ = std::fs::remove_file(&self.snapshot);
+                self.snapshot = snapshot;
+                self.snapshot_seq = seq;
+                self.snapshot_at = now_secs();
+                self.search_state = search_state;
+            }
+            Err(e) => {
+                self.status = format!("refresh failed: {e}");
+                return;
+            }
+        }
         if let Err(e) = self.load_namespaces() {
             self.status = format!("refresh failed: {e}");
         }
-        self.ns_state
-            .select(keep_ns.filter(|i| *i < self.namespaces.len()).or(Some(0)));
+        let idx = match &self.scope {
+            Some(name) => self.namespaces.iter().position(|(n, _)| n == name),
+            None => Some(0),
+        };
+        if idx.is_none() {
+            self.scope = None;
+        }
+        self.ns_state.select(idx.or(Some(0)));
         if self.active_query.is_some() {
             self.search();
         } else {
@@ -439,6 +607,7 @@ impl App {
     fn activate(&mut self) {
         match self.pane {
             Pane::Namespaces => {
+                self.scope = self.namespace_at_cursor();
                 self.query.clear();
                 self.load_page(0);
                 self.load_tasks();
@@ -604,7 +773,9 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("yantrikdb", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(app.store.clone(), Style::default().fg(Color::DarkGray)),
-        Span::raw("  read-only · "),
+        Span::raw("  "),
+        Span::styled(app.header_note(), Style::default().fg(Color::DarkGray)),
+        Span::raw("  · "),
         Span::styled(
             "Tab panes · ↑↓ move · Enter open · / search · Esc clear · n/p page · PgUp/PgDn scroll · r refresh · q quit",
             Style::default().fg(Color::DarkGray),
@@ -779,6 +950,12 @@ fn first_line(text: &str, width: usize) -> String {
     out
 }
 
+/// `HH:MM:SS` (UTC) from unix seconds.
+fn fmt_clock(secs: f64) -> String {
+    let s = secs.max(0.0) as u64 % 86_400;
+    format!("{:02}:{:02}:{:02}Z", s / 3600, (s % 3600) / 60, s % 60)
+}
+
 /// `YYYY-MM-DD` from unix seconds, no calendar crate: days-to-civil per
 /// Howard Hinnant's algorithm.
 fn fmt_day(secs: f64) -> String {
@@ -818,45 +995,57 @@ mod tests {
 
     // ── headless app tests: the data path without a terminal ────────
 
-    fn temp_store(name: &str) -> String {
-        let dir =
-            std::env::temp_dir().join(format!("yantrikdb-tui-{}-{}", std::process::id(), name));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("store.db").to_string_lossy().into_owned()
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("yantrikdb-tui-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
-    /// Two namespaces, one memory with a stated claim, a correction, an
-    /// explicit entity link, and one task.
-    fn seeded(name: &str) -> (App, String) {
-        // One directory per TEST: tests run in parallel threads and two
-        // engines on one store in one process is exactly what must not happen.
-        let path = temp_store(name);
-        let db = YantrikDB::with_default(&path).unwrap();
-        let rec = |ns: &str, text: &str| {
-            db.record_text(
-                text,
-                "semantic",
-                0.6,
-                0.0,
-                604800.0,
-                &serde_json::json!({}),
-                ns,
-                0.8,
-                "general",
-                "user",
-                None,
-            )
-            .unwrap()
-        };
-        let dana = rec(
+    /// A writer engine on `path` at the bundled dimension: no model download
+    /// in CI, and the store records the bundled embedder's identity.
+    fn writer(path: &Path) -> YantrikDB {
+        YantrikDB::new(
+            &path.to_string_lossy(),
+            yantrikdb::embedder::BUNDLED_EMBEDDER_DIM,
+        )
+        .unwrap()
+    }
+
+    fn record(db: &YantrikDB, ns: &str, text: &str) -> String {
+        db.record_text(
+            text,
+            "semantic",
+            0.6,
+            0.0,
+            604800.0,
+            &serde_json::json!({}),
+            ns,
+            0.8,
+            "general",
+            "user",
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Build the SOURCE with a writer engine and close it: two namespaces,
+    /// a memory with a stated claim, a correction, an explicit entity link,
+    /// one task. Returns the source path and the Dana rid.
+    fn build_source(dir: &Path) -> (PathBuf, String) {
+        let path = dir.join("source.db");
+        let db = writer(&path);
+        let dana = record(
+            &db,
             "work",
             "Dana Okafor leads the Data Platform team at Northwind Analytics.",
         );
-        rec(
+        record(
+            &db,
             "work",
             "Helios is the nightly feature pipeline at Northwind Analytics.",
         );
-        rec(
+        record(
+            &db,
             "personal",
             "Ari Vasquez lives in Lisbon and cycles to the office.",
         );
@@ -877,12 +1066,58 @@ mod tests {
         db.link_memory_entity(&dana, "Northwind Analytics").unwrap();
         db.task_add("work", "Ship the atlas TUI", "high", None)
             .unwrap();
-        (App::new(db, path.clone()).unwrap(), dana)
+        db.close().unwrap();
+        (path, dana)
+    }
+
+    fn seeded(name: &str) -> (App, String, PathBuf) {
+        let (path, dana) = build_source(&temp_dir(name));
+        (App::open(path.clone()).unwrap(), dana, path)
+    }
+
+    fn file_hash(path: &Path) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let bytes = std::fs::read(path).ok()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        Some(h.finish())
+    }
+
+    /// Hash of the source file plus the byte length of its WAL sidecar (0 when
+    /// absent). A read-only connection on a WAL-mode database may create an
+    /// EMPTY `-wal`/`-shm` pair on open; that carries no frames and no state,
+    /// so "untouched" means the main file's bytes are identical and the WAL
+    /// holds no more bytes than before.
+    fn source_state(path: &Path) -> (Option<u64>, u64) {
+        let wal = path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        (
+            file_hash(path),
+            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        )
+    }
+
+    fn meta_value(path: &Path, key: &str) -> String {
+        let c =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
     }
 
     #[test]
     fn app_lists_namespaces_memories_and_inspects_without_a_terminal() {
-        let (mut app, dana) = seeded("lists");
+        let (mut app, dana, source) = seeded("lists");
+        assert_ne!(app.snapshot, source, "the engine runs on a private copy");
+        assert!(
+            matches!(app.search_state, SearchState::Ready(_)),
+            "{}",
+            app.header_note()
+        );
         let names: Vec<&str> = app.namespaces.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["(all)", "personal", "work"]);
         assert_eq!(app.namespaces[0].1, 3);
@@ -894,6 +1129,7 @@ mod tests {
         app.move_selection(1);
         app.activate();
         assert_eq!(app.pane, Pane::Memories);
+        assert_eq!(app.scope.as_deref(), Some("work"));
         assert_eq!(app.memories.len(), 2);
         assert!(
             app.tasks.iter().any(|t| t.contains("Ship the atlas TUI")),
@@ -926,10 +1162,10 @@ mod tests {
 
     #[test]
     fn search_returns_scored_hits_and_clearing_restores_the_listing() {
-        let (mut app, dana) = seeded("search");
+        let (mut app, dana, _) = seeded("search");
         app.query = "who leads the data platform team".into();
         app.search();
-        assert!(app.active_query.is_some());
+        assert!(app.active_query.is_some(), "{}", app.status);
         assert!(!app.memories.is_empty());
         assert!(app.memories.iter().all(|m| m.score.is_some()));
         assert!(
@@ -945,6 +1181,110 @@ mod tests {
         assert_eq!(app.memories.len(), 3);
     }
 
+    #[test]
+    fn opening_never_touches_the_source_even_with_an_older_schema_stamp() {
+        let (path, _) = build_source(&temp_dir("untouched"));
+        // Pretend the source predates the current schema: an ordinary engine
+        // open would MAX-stamp it back to current and migrate it.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute(
+                "UPDATE meta SET value = '40' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+            c.close().unwrap();
+        }
+        let before = source_state(&path);
+        let app = App::open(path.clone()).unwrap();
+        assert_eq!(
+            source_state(&path),
+            before,
+            "source bytes and WAL unchanged by opening"
+        );
+        assert_eq!(
+            meta_value(&path, "schema_version"),
+            "40",
+            "source schema stamp untouched"
+        );
+        assert_eq!(app.total, 3);
+        let copy_version: i64 = meta_value(&app.snapshot, "schema_version").parse().unwrap();
+        assert!(copy_version > 40, "the COPY is migrated; the source is not");
+        drop(app);
+        assert_eq!(source_state(&path), before, "still untouched after close");
+    }
+
+    #[test]
+    fn snapshot_under_an_active_writer_is_a_moment_in_time_and_the_writer_continues() {
+        let path = temp_dir("writer").join("source.db");
+        let w = writer(&path);
+        for i in 0..12 {
+            record(
+                &w,
+                "work",
+                &format!("Nightly run {i} completed with no failures."),
+            );
+        }
+        // Snapshot while the writer holds the source open (same library, same
+        // process: one plain read-only connection alongside the engine's).
+        let mut app = App::open(path.clone()).unwrap();
+        assert_eq!(app.total, 12);
+        for i in 12..18 {
+            record(&w, "ops", &format!("Backup {i} rotated the logs."));
+        }
+        assert_eq!(app.total, 12, "a snapshot does not move");
+        app.refresh();
+        assert_eq!(app.total, 18, "refresh takes a new snapshot");
+        assert!(app.namespaces.iter().any(|(n, _)| n == "ops"));
+        record(&w, "work", "The writer is undisturbed by the explorer.");
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn refresh_keeps_the_scope_by_name_and_lists_new_and_task_only_namespaces() {
+        let (path, _) = build_source(&temp_dir("scope"));
+        let mut app = App::open(path.clone()).unwrap();
+        let work = app
+            .namespaces
+            .iter()
+            .position(|(n, _)| n == "work")
+            .unwrap();
+        app.pane = Pane::Namespaces;
+        app.ns_state.select(Some(work));
+        app.activate();
+        assert_eq!(app.scope.as_deref(), Some("work"));
+        assert_eq!(app.memories.len(), 2);
+
+        // Meanwhile a writer adds a namespace that sorts BEFORE "work" and a
+        // task-only namespace.
+        let w = writer(&path);
+        record(&w, "aaa", "A new namespace appears.");
+        w.task_add("planning", "Task-only namespace", "low", None)
+            .unwrap();
+        w.close().unwrap();
+
+        app.refresh();
+        assert_eq!(
+            app.scope.as_deref(),
+            Some("work"),
+            "scope kept by name, not by index"
+        );
+        assert_eq!(app.namespaces[app.ns_state.selected().unwrap()].0, "work");
+        assert_eq!(app.memories.len(), 2);
+        assert!(
+            app.namespaces.iter().any(|(n, c)| n == "aaa" && *c == 1),
+            "{:?}",
+            app.namespaces
+        );
+        assert!(
+            app.namespaces
+                .iter()
+                .any(|(n, c)| n == "planning" && *c == 0),
+            "{:?}",
+            app.namespaces
+        );
+    }
+
     /// Manual smoke against a real store, when one is named:
     /// `YANTRIKDB_TUI_SMOKE_STORE=path cargo test -p yantrikdb-tui -- --nocapture smoke`
     #[test]
@@ -952,9 +1292,8 @@ mod tests {
         let Ok(path) = std::env::var("YANTRIKDB_TUI_SMOKE_STORE") else {
             return;
         };
-        let mut db = YantrikDB::with_default(&path).unwrap();
-        eprintln!("embedder: {}", attach_store_embedder(&mut db));
-        let mut app = App::new(db, path).unwrap();
+        let mut app = App::open(PathBuf::from(path)).unwrap();
+        eprintln!("{}", app.header_note());
         eprintln!("namespaces: {:?}", app.namespaces);
         eprintln!("first page: {} of {}", app.memories.len(), app.total);
         app.query = "who leads the data platform team".into();
@@ -975,9 +1314,6 @@ mod tests {
             );
             for c in &ins.claims {
                 eprintln!("  claim: {c}");
-            }
-            for r in &ins.revisions {
-                eprintln!("  revision: {}", r.replace('\n', " | "));
             }
         }
         assert!(!app.namespaces.is_empty());

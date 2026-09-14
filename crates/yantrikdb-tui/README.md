@@ -26,19 +26,25 @@ Keys: `Tab`/`Shift-Tab` move between panes, `↑`/`↓` or `j`/`k` move,
 
 ## What it promises
 
-- **Read-only by construction.** Every read goes through the engine's
-  non-reinforcing paths (`recall(..., skip_reinforce = true, ...)`,
-  `list_memories`, `get`, the `engine::inspect` reads), so opening a store
-  here leaves no access-count trace and writes nothing.
-- **Searches with the store's own model.** It reads the embedder identity
-  the store recorded and attaches that model by name (a store built with
-  the default `potion-base-8M` needs the cached 28 MB tarball the engine
-  already keeps). If that fails, the status line says search is degraded
-  rather than pretending.
-- **Safe beside a live agent in another process.** The store is opened
-  with the engine's own SQLite in this process; separate processes are
-  serialised by the kernel (CONCURRENCY.md rule 9 forbids a second SQLite
-  *library in one process*, which this is not).
+- **The source is never opened by the engine.** An ordinary engine open is
+  not read-only (journal switch to WAL, schema migrations, backfills), so
+  the explorer first takes a consistent snapshot with SQLite's online
+  backup through a plain read-only connection of the engine's own library,
+  then builds the engine on that private copy. The source's bytes, journal
+  mode and schema stamp stay as they were; an agent writing to it from
+  another process is undisturbed; `r` takes a fresh snapshot, and the
+  header shows when the current one was taken.
+- **Non-reinforcing reads on the copy.** `recall(..., skip_reinforce =
+  true, ...)`, `list_memories`, `get` and the `engine::inspect` reads.
+- **Searches with the store's own model, verified.** It reads the embedder
+  identity the store recorded, attaches that model by name when needed (a
+  store built with the default `potion-base-8M` reuses the engine's cached
+  tarball), and verifies the attached model's digest against the record.
+  Anything short of a verified match disables search and says why; a
+  matching dimension alone is never taken as proof.
+- **Complete namespace list.** Namespaces with memories carry their live
+  count; namespaces that only hold tasks are listed with 0. The scope you
+  chose survives a refresh by name.
 - **Zero model calls beyond the local embedder.** No network, no LLM.
 
 ## Not (yet)

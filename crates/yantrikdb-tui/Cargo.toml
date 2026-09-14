@@ -21,6 +21,6 @@ yantrikdb = { path = "../yantrikdb-core", version = "0.22.0", features = ["embed
 # Same version and features as the engine so exactly ONE SQLite is linked
 # (CONCURRENCY.md rule 9 is about a second library; this is the same one,
 # reached through `YantrikDB::conn()`).
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 ratatui = "0.30"
 serde_json = "1"
