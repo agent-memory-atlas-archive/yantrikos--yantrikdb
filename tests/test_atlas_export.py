@@ -6,7 +6,15 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from export_atlas import export
+import importlib.util
+
+# Load the packaged exporter BY PATH, exactly as the CLI and the MCP tool run
+# it (as a script in a child process), so this test never imports the
+# `yantrikdb` package and its native engine.
+_SCRIPT = Path(__file__).resolve().parents[1] / 'src' / 'yantrikdb' / 'atlas' / 'export_atlas.py'
+_spec = importlib.util.spec_from_file_location('atlas_export_under_test', _SCRIPT)
+_mod = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+export = _mod.export
 
 class ExportTests(unittest.TestCase):
     def fixture(self, base):
@@ -51,5 +59,44 @@ class ExportTests(unittest.TestCase):
             self.assertTrue(all(r['valid_to'] is None for r in d['claims']))
             self.assertEqual(d['revisions'][0]['memory_id'],0)
             self.assertEqual(d['groups'][d['tasks'][0]['g']]['namespace'],'learning')
+
+    def test_single_file_exports_only_the_named_store(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp); c,stores=self.fixture(base); c.commit(); c.close()
+            other=sqlite3.connect(stores/'sibling.db')
+            other.execute('CREATE TABLE memories (rid TEXT,namespace TEXT,type TEXT,text TEXT,importance REAL,created_at REAL,metadata TEXT,consolidation_status TEXT)')
+            other.execute("INSERT INTO memories VALUES ('s1','work','semantic','Sibling store memory',.5,5,'{}','active')")
+            other.commit(); other.close()
+            with contextlib.redirect_stdout(io.StringIO()): export(stores/'sample.db',base/'site')
+            d=json.loads((base/'site/data.json').read_bytes())
+            self.assertEqual([s['store'] for s in d['sources']],['sample.db'])
+            self.assertEqual(len(d['memories']),2)
+            self.assertTrue(all(g['name'].startswith('sample /') for g in d['groups']))
+            with self.assertRaises(ValueError): export(stores/'notes.txt',base/'site2')
+
+    def test_encrypted_store_is_refused_not_exported_as_ciphertext(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp); c,stores=self.fixture(base)
+            c.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+            c.execute("INSERT INTO meta VALUES ('encryption_enabled','1')")
+            c.commit(); c.close()
+            with self.assertRaises(ValueError) as ctx:
+                with contextlib.redirect_stdout(io.StringIO()): export(stores,base/'site')
+            self.assertIn('encrypted', str(ctx.exception))
+            self.assertFalse((base/'site/data.json').exists())
+
+    def test_refresh_replaces_a_symlinked_artifact_and_leaves_its_target_alone(self):
+        import os
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp); c,stores=self.fixture(base); c.commit(); c.close()
+            site=base/'site'; site.mkdir()
+            target=base/'elsewhere.json'; target.write_text('{"untouched": true}', encoding='utf-8')
+            try: os.symlink(target, site/'data.json')
+            except (OSError, NotImplementedError): self.skipTest('symlinks not available here')
+            with contextlib.redirect_stdout(io.StringIO()): export(stores,site)
+            self.assertFalse((site/'data.json').is_symlink(), 'the link is replaced, not followed')
+            self.assertEqual(target.read_text(encoding='utf-8'), '{"untouched": true}')
+            self.assertIn('memories', json.loads((site/'data.json').read_bytes()))
+            self.assertEqual([p.name for p in site.iterdir() if p.name.startswith('.')], [], 'no temp files left behind')
 
 if __name__=='__main__': unittest.main()

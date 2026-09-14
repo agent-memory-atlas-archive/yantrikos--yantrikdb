@@ -36,6 +36,7 @@ mod idempotency;
 pub mod importance;
 mod impressions;
 mod indices;
+pub mod inspect;
 mod intent;
 mod introspection;
 mod learning;

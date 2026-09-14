@@ -1,5 +1,6 @@
 mod cognition;
 mod graph;
+mod inspect;
 mod memory;
 mod pack;
 mod session_temporal;

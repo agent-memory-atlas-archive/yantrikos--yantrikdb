@@ -642,6 +642,73 @@ def import_memories(db_path, source, path, namespace, user_id, api_key, limit, d
         sys.exit(1)
 
 
+# ── Atlas ──
+
+
+@cli.command()
+@click.argument("db_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("-o", "--out", "out_dir", default=None,
+              help="Output directory for the page and data "
+                   "(default: <store>.atlas next to the store).")
+@click.option("--label", default=None,
+              help="Optional provenance label shown in the page header.")
+@click.option("--serve/--no-serve", default=True, show_default=True,
+              help="Serve the export on 127.0.0.1 after writing it (Ctrl-C stops).")
+@click.option("--port", default=0, type=int, show_default=True,
+              help="Port for --serve (0 picks a free one).")
+@click.option("--open", "open_browser", is_flag=True,
+              help="Open the served page in the default browser.")
+def atlas(db_path, out_dir, label, serve, port, open_browser):
+    """Export the Memory Atlas for ONE store and serve it locally.
+
+    The atlas is a static page: every memory the store still holds, the
+    entities linked to it, the claims it backs, its revision history and
+    the namespace's tasks. Only the named store is exported, never its
+    sibling files. The export runs in a child process that reads the file
+    with the standard library's sqlite3 in read-only mode, so no second
+    SQLite library ever opens the store inside this process, and the
+    exporter refuses if the file changes while it reads.
+    """
+    import subprocess
+
+    from yantrikdb.atlas.serve import atlas_out_dir, serve_export
+
+    store = Path(db_path).resolve()
+    try:
+        out = atlas_out_dir(Path(out_dir) if out_dir else store.with_name(store.name + ".atlas"), store)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    script = Path(__file__).with_name("atlas") / "export_atlas.py"
+    cmd = [sys.executable, str(script), "--stores", str(store), "--out", str(out)]
+    if label:
+        cmd += ["--label", label]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        # The exporter's own message (e.g. "is encrypted"), never a traceback.
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        click.echo(err[-1] if err else "atlas export failed", err=True)
+        sys.exit(proc.returncode or 1)
+    if proc.stdout.strip():
+        click.echo(proc.stdout.strip(), err=True)
+    click.echo(f"Atlas written to {out}", err=True)
+    if not serve:
+        return
+
+    # Serves exactly index.html, data.json and export-report.json from the
+    # export directory; no listings, no neighbours, no symlink escapes.
+    httpd, url = serve_export(out, port)
+    with httpd:
+        click.echo(f"Serving {out} at {url} (Ctrl-C to stop)", err=True)
+        if open_browser:
+            import webbrowser
+
+            webbrowser.open(url)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
 def main():
     """Entry point for the yantrikdb CLI console script."""
     cli()
