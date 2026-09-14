@@ -230,9 +230,12 @@ fn open_snapshot(source: &Path) -> Result<Opened, Box<dyn Error>> {
     })
 }
 
-/// Stop the workers, then close the engine: `close` consumes the engine, so
-/// the `Arc` must be unique; a worker mid-iteration can hold it a moment
-/// longer, in which case dropping our reference lets the last one close it.
+/// Stop the workers, then close the engine. Dropping the guards signals the
+/// worker threads and JOINS them, so by the time `try_unwrap` runs no worker
+/// holds the engine; `close` consumes it, so the `Arc` must be unique. An
+/// `Err` here therefore means some other owner still holds the engine, which
+/// is a bug in the caller rather than worker lag; the fallback drops our
+/// reference so the last owner's drop closes it.
 fn shutdown(workers: Option<AllWorkerGuards>, db: Arc<YantrikDB>) -> Result<(), Box<dyn Error>> {
     drop(workers);
     match Arc::try_unwrap(db) {
@@ -1595,13 +1598,17 @@ mod tests {
         assert!(!da.exists() && !db_.exists());
     }
 
-    /// ENGINE STALL REPRODUCER (ignored by default; an engine finding, not
-    /// an explorer property). The exact loop that produced two stalls on
-    /// Windows during this work: a single writer that SATURATES the
-    /// engine's backpressure limit and retries on `retry_after_ms`, while
-    /// three snapshots are taken, then teardown. A watchdog prints the last
-    /// phase marker and aborts after 60 s so a stall is located, not merely
-    /// waited out. Run repeatedly:
+    /// MISSING-WORKER-POOL REPRODUCER (ignored by default). What looked like
+    /// an engine stall during this work was a Rust-constructed engine
+    /// without `spawn_all_workers`: with no compactor the delta tier fills
+    /// at 256 and every later write is refused with Backpressure forever;
+    /// the "stall" was that refusal behind a retry loop without a stop
+    /// check. The engine-stall claim is withdrawn. This test is retained as
+    /// a regression check that a worker-backed engine keeps draining under
+    /// an unthrottled single writer (measured 992–1,345 rows per 8 s with
+    /// zero backpressure hits) while three snapshots are taken and torn
+    /// down. A watchdog prints the last phase marker and aborts after 60 s
+    /// so any future stall is located, not merely waited out. Run:
     /// `cargo test -p yantrikdb-tui -- --ignored --nocapture engine_stall`
     #[test]
     #[ignore]
