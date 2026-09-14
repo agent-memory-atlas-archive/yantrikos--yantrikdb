@@ -156,22 +156,26 @@ impl SnapshotGuard {
     }
 }
 
+/// Remove `dir` and everything under it, best effort with retries (up to
+/// ~2 s): on Windows the engine's file handles are released on the last
+/// reference drop, which can trail `close()` while its worker threads wind
+/// down. A process killed outright cannot run this at all.
+fn remove_dir_with_retries(dir: &Path) {
+    for attempt in 0..40 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) if attempt < 39 => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {}
+        }
+    }
+}
+
 impl Drop for SnapshotGuard {
     fn drop(&mut self) {
-        // Best effort with retries (up to ~2 s): on Windows the engine's file
-        // handles are released on the last reference drop, which can trail
-        // `close()` while its worker threads wind down. A process killed
-        // outright cannot run this; such leftovers carry the dead pid in
-        // their name and are never reused (names are random and created
-        // exclusively).
-        for attempt in 0..40 {
-            match std::fs::remove_dir_all(&self.dir) {
-                Ok(()) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(_) if attempt < 39 => std::thread::sleep(Duration::from_millis(50)),
-                Err(_) => {}
-            }
-        }
+        // Leftovers from a killed process carry the dead pid in their name and
+        // are never reused (names are random and created exclusively).
+        remove_dir_with_retries(&self.dir);
     }
 }
 
@@ -1118,10 +1122,33 @@ mod tests {
 
     // ── headless app tests: the data path without a terminal ────────
 
-    fn temp_dir(name: &str) -> PathBuf {
+    /// A fixture directory that removes itself when the test's binding goes
+    /// out of scope — including on a panic, which is how 231 such directories
+    /// (330 MB of stores) accumulated in %TEMP% while this crate was written.
+    /// Bind it (`let dir = temp_dir("x");`) for as long as the files are
+    /// needed; a temporary would be dropped at the end of the statement.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            remove_dir_with_retries(&self.0);
+        }
+    }
+
+    fn temp_dir(name: &str) -> TempDir {
         let d = std::env::temp_dir().join(format!("yantrikdb-tui-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TempDir(d)
     }
 
     /// A writer engine WITH its worker pool, as the Python binding constructs
@@ -1232,9 +1259,12 @@ mod tests {
         (path, dana)
     }
 
-    fn seeded(name: &str) -> (App, String, PathBuf) {
-        let (path, dana) = build_source(&temp_dir(name));
-        (App::open(path.clone()).unwrap(), dana, path)
+    /// The returned `TempDir` must be held for the life of the test: dropping
+    /// it removes the source store.
+    fn seeded(name: &str) -> (App, String, PathBuf, TempDir) {
+        let dir = temp_dir(name);
+        let (path, dana) = build_source(dir.path());
+        (App::open(path.clone()).unwrap(), dana, path, dir)
     }
 
     fn file_hash(path: &Path) -> Option<u64> {
@@ -1273,7 +1303,7 @@ mod tests {
 
     #[test]
     fn app_lists_namespaces_memories_and_inspects_without_a_terminal() {
-        let (mut app, dana, source) = seeded("lists");
+        let (mut app, dana, source, _dir) = seeded("lists");
         assert_ne!(
             app.snapshot.db_path(),
             source,
@@ -1329,7 +1359,7 @@ mod tests {
 
     #[test]
     fn search_returns_scored_hits_and_clearing_restores_the_listing() {
-        let (mut app, dana, _) = seeded("search");
+        let (mut app, dana, _, _dir) = seeded("search");
         app.query = "who leads the data platform team".into();
         app.search();
         assert!(app.active_query.is_some(), "{}", app.status);
@@ -1351,7 +1381,8 @@ mod tests {
 
     #[test]
     fn opening_never_touches_the_source_even_with_an_older_schema_stamp() {
-        let (path, _) = build_source(&temp_dir("untouched"));
+        let dir = temp_dir("untouched");
+        let (path, _) = build_source(dir.path());
         // Pretend the source predates the current schema: an ordinary engine
         // open would MAX-stamp it back to current and migrate it.
         {
@@ -1390,7 +1421,8 @@ mod tests {
     /// is the next test.
     #[test]
     fn snapshot_with_an_open_writer_is_a_moment_in_time_and_the_writer_continues() {
-        let path = temp_dir("writer").join("source.db");
+        let dir = temp_dir("writer");
+        let path = dir.join("source.db");
         let w = writer(&path);
         for i in 0..12 {
             record(
@@ -1419,7 +1451,8 @@ mod tests {
     #[test]
     fn snapshot_while_a_background_writer_commits_is_consistent() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let path = temp_dir("concurrent").join("source.db");
+        let dir = temp_dir("concurrent");
+        let path = dir.join("source.db");
         let w = writer(&path);
         for i in 0..20 {
             record(&w, "work", &format!("Seed row {i}."));
@@ -1503,7 +1536,8 @@ mod tests {
 
     #[test]
     fn refresh_keeps_the_scope_by_name_and_lists_new_and_task_only_namespaces() {
-        let (path, _) = build_source(&temp_dir("scope"));
+        let dir = temp_dir("scope");
+        let (path, _) = build_source(dir.path());
         let mut app = App::open(path.clone()).unwrap();
         let work = app
             .namespaces
@@ -1554,7 +1588,7 @@ mod tests {
 
     #[test]
     fn closing_removes_the_snapshot_directory() {
-        let (app, _, _) = seeded("cleanup");
+        let (app, _, _, _dir) = seeded("cleanup");
         let dir = app.snapshot.dir.clone();
         assert!(dir.join("snapshot.db").is_file());
         app.close().unwrap();
@@ -1566,12 +1600,14 @@ mod tests {
         // Backup from a missing source.
         let guard = SnapshotGuard::create().unwrap();
         let dir = guard.dir.clone();
-        assert!(take_snapshot(&temp_dir("missing").join("does-not-exist.db"), &guard).is_err());
+        let missing = temp_dir("missing");
+        assert!(take_snapshot(&missing.join("does-not-exist.db"), &guard).is_err());
         drop(guard);
         assert!(!dir.exists(), "directory removed after a failed backup");
 
         // Backup from a file that is not a database.
-        let bogus = temp_dir("bogus").join("not-a-db.db");
+        let bogus_dir = temp_dir("bogus");
+        let bogus = bogus_dir.join("not-a-db.db");
         std::fs::write(&bogus, b"not a database").unwrap();
         let guard = SnapshotGuard::create().unwrap();
         let dir = guard.dir.clone();
@@ -1635,7 +1671,8 @@ mod tests {
                 std::process::abort();
             });
         }
-        let path = temp_dir("stall").join("source.db");
+        let stall_dir = temp_dir("stall");
+        let path = stall_dir.join("source.db");
         let w = writer(&path);
         mark("seed".into());
         for i in 0..20 {
