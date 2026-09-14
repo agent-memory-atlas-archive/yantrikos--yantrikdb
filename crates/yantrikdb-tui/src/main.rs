@@ -31,7 +31,7 @@ use yantrikdb::YantrikDB;
 const PAGE_SIZE: usize = 200;
 const SEARCH_TOP_K: usize = 50;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pane {
     Namespaces,
     Memories,
@@ -93,8 +93,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("no store file at {store}");
         std::process::exit(2);
     }
-    let db = YantrikDB::with_default(&store)?;
+    let mut db = YantrikDB::with_default(&store)?;
+    let embedder_note = attach_store_embedder(&mut db);
     let mut app = App::new(db, store)?;
+    app.status = format!("{} · {embedder_note}", app.status);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
@@ -136,7 +138,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(), Box
             }
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
                 KeyCode::Tab => app.pane = next_pane(app.pane, true),
                 KeyCode::BackTab => app.pane = next_pane(app.pane, false),
                 KeyCode::Char('/') => {
@@ -169,6 +173,34 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(), Box
                 _ => {}
             }
         }
+    }
+}
+
+/// Search must embed queries with the SAME model that built the store's
+/// vectors. `with_default` opens an existing store at its recorded
+/// dimension but attaches only the bundled embedder; a store written with
+/// a named model (the default for new stores is potion-base-8M, 256-d)
+/// records that identity in `meta`, so attach it by name. Returns a note
+/// for the status line; on failure search still runs but is degraded, and
+/// the note says so rather than pretending.
+fn attach_store_embedder(db: &mut YantrikDB) -> String {
+    match db.embedder_identity() {
+        Ok(Some((Some(name), _digest, dim)))
+            if dim != yantrikdb::embedder::BUNDLED_EMBEDDER_DIM =>
+        {
+            match db.set_embedder_named(&name) {
+                Ok(()) => format!("embedder {name} · {dim}-d"),
+                Err(e) => format!("search degraded: store needs embedder {name} ({dim}-d): {e}"),
+            }
+        }
+        Ok(Some((name, _digest, dim))) => {
+            format!(
+                "embedder {} · {dim}-d",
+                name.unwrap_or_else(|| "bundled".to_string())
+            )
+        }
+        Ok(None) => "no recorded embedder identity; engine default attached".to_string(),
+        Err(e) => format!("embedder identity unreadable: {e}"),
     }
 }
 
@@ -225,7 +257,9 @@ impl App {
             }
         }
         let all: i64 = rows.iter().map(|(_, n)| n).sum();
-        self.namespaces = std::iter::once(("(all)".to_string(), all)).chain(rows).collect();
+        self.namespaces = std::iter::once(("(all)".to_string(), all))
+            .chain(rows)
+            .collect();
         Ok(())
     }
 
@@ -240,10 +274,14 @@ impl App {
 
     fn load_page(&mut self, page: usize) {
         let ns = self.selected_namespace();
-        match self
-            .db
-            .list_memories(PAGE_SIZE, page * PAGE_SIZE, None, None, ns.as_deref(), "created_at")
-        {
+        match self.db.list_memories(
+            PAGE_SIZE,
+            page * PAGE_SIZE,
+            None,
+            None,
+            ns.as_deref(),
+            "created_at",
+        ) {
             Ok((mems, total)) => {
                 self.memories = mems
                     .into_iter()
@@ -259,7 +297,11 @@ impl App {
                 self.total = total;
                 self.page = page;
                 self.active_query = None;
-                self.mem_state.select(if self.memories.is_empty() { None } else { Some(0) });
+                self.mem_state.select(if self.memories.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
                 self.status = format!(
                     "{} memories · page {}/{}",
                     total,
@@ -320,7 +362,11 @@ impl App {
                     .collect();
                 self.status = format!("{} hits for \"{}\" (Esc clears)", self.memories.len(), q);
                 self.active_query = Some(q);
-                self.mem_state.select(if self.memories.is_empty() { None } else { Some(0) });
+                self.mem_state.select(if self.memories.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
                 self.open_selected();
             }
             Err(e) => self.status = format!("search failed: {e}"),
@@ -351,7 +397,10 @@ impl App {
         if self.active_query.is_some() {
             self.search();
         } else {
-            self.load_page(self.page.min(self.total.div_ceil(PAGE_SIZE).saturating_sub(1)));
+            self.load_page(
+                self.page
+                    .min(self.total.div_ceil(PAGE_SIZE).saturating_sub(1)),
+            );
         }
         self.load_tasks();
     }
@@ -364,7 +413,8 @@ impl App {
                     return;
                 }
                 let i = self.ns_state.selected().unwrap_or(0) as i32 + delta;
-                self.ns_state.select(Some(i.clamp(0, n as i32 - 1) as usize));
+                self.ns_state
+                    .select(Some(i.clamp(0, n as i32 - 1) as usize));
             }
             Pane::Memories => {
                 let n = self.memories.len();
@@ -372,7 +422,8 @@ impl App {
                     return;
                 }
                 let i = self.mem_state.selected().unwrap_or(0) as i32 + delta;
-                self.mem_state.select(Some(i.clamp(0, n as i32 - 1) as usize));
+                self.mem_state
+                    .select(Some(i.clamp(0, n as i32 - 1) as usize));
                 self.open_selected();
             }
             Pane::Inspector => {
@@ -515,7 +566,11 @@ impl App {
 fn ui(f: &mut Frame, app: &mut App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
         .split(f.area());
     draw_title(f, outer[0], app);
     let cols = Layout::default()
@@ -538,7 +593,10 @@ fn border(app: &App, pane: Pane, title: String) -> Block<'static> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Block::default().borders(Borders::ALL).border_style(style).title(title)
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(title)
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
@@ -588,7 +646,11 @@ fn draw_memories(f: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(lead, Style::default().fg(Color::DarkGray)),
                 Span::raw(text),
                 Span::styled(
-                    format!(" {}{:.1}", &m.memory_type[..1.min(m.memory_type.len())], m.importance),
+                    format!(
+                        " {}{:.1}",
+                        &m.memory_type[..1.min(m.memory_type.len())],
+                        m.importance
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]))
@@ -613,7 +675,9 @@ fn draw_inspector(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(8), Constraint::Length(6)])
         .split(area);
     let dim = Style::default().fg(Color::DarkGray);
-    let head = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let head = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line> = Vec::new();
     match &app.inspector {
         None => lines.push(Line::from(Span::styled("select a memory", dim))),
@@ -654,7 +718,11 @@ fn draw_inspector(f: &mut Frame, area: Rect, app: &App) {
             }
             for r in &ins.revisions {
                 for (i, l) in r.lines().enumerate() {
-                    lines.push(Line::from(if i == 0 { format!("• {l}") } else { l.to_string() }));
+                    lines.push(Line::from(if i == 0 {
+                        format!("• {l}")
+                    } else {
+                        l.to_string()
+                    }));
                 }
             }
         }
@@ -670,7 +738,10 @@ fn draw_inspector(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(para, rows[0]);
 
     let task_lines: Vec<Line> = if app.selected_namespace().is_none() {
-        vec![Line::from(Span::styled("select a namespace to see its tasks", dim))]
+        vec![Line::from(Span::styled(
+            "select a namespace to see its tasks",
+            dim,
+        ))]
     } else if app.tasks.is_empty() {
         vec![Line::from(Span::styled("no tasks", dim))]
     } else {
@@ -743,5 +814,172 @@ mod tests {
     fn first_line_truncates_with_ellipsis() {
         assert_eq!(first_line("hello world\nsecond", 5), "hello…");
         assert_eq!(first_line("short", 10), "short");
+    }
+
+    // ── headless app tests: the data path without a terminal ────────
+
+    fn temp_store(name: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("yantrikdb-tui-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("store.db").to_string_lossy().into_owned()
+    }
+
+    /// Two namespaces, one memory with a stated claim, a correction, an
+    /// explicit entity link, and one task.
+    fn seeded(name: &str) -> (App, String) {
+        // One directory per TEST: tests run in parallel threads and two
+        // engines on one store in one process is exactly what must not happen.
+        let path = temp_store(name);
+        let db = YantrikDB::with_default(&path).unwrap();
+        let rec = |ns: &str, text: &str| {
+            db.record_text(
+                text,
+                "semantic",
+                0.6,
+                0.0,
+                604800.0,
+                &serde_json::json!({}),
+                ns,
+                0.8,
+                "general",
+                "user",
+                None,
+            )
+            .unwrap()
+        };
+        let dana = rec(
+            "work",
+            "Dana Okafor leads the Data Platform team at Northwind Analytics.",
+        );
+        rec(
+            "work",
+            "Helios is the nightly feature pipeline at Northwind Analytics.",
+        );
+        rec(
+            "personal",
+            "Ari Vasquez lives in Lisbon and cycles to the office.",
+        );
+        db.attach_claims(
+            &dana,
+            &[yantrikdb::StatedClaim {
+                src: "Dana Okafor".into(),
+                rel_type: "leads".into(),
+                dst: "Data Platform team".into(),
+                polarity: 1,
+                valid_from: None,
+                valid_to: None,
+            }],
+        )
+        .unwrap();
+        db.correct(&dana, None, None, Some(0.9), None, "importance bump")
+            .unwrap();
+        db.link_memory_entity(&dana, "Northwind Analytics").unwrap();
+        db.task_add("work", "Ship the atlas TUI", "high", None)
+            .unwrap();
+        (App::new(db, path.clone()).unwrap(), dana)
+    }
+
+    #[test]
+    fn app_lists_namespaces_memories_and_inspects_without_a_terminal() {
+        let (mut app, dana) = seeded("lists");
+        let names: Vec<&str> = app.namespaces.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["(all)", "personal", "work"]);
+        assert_eq!(app.namespaces[0].1, 3);
+        assert_eq!(app.memories.len(), 3, "every namespace at start");
+
+        // Select "work" in the namespace pane and open it.
+        app.pane = Pane::Namespaces;
+        app.move_selection(1);
+        app.move_selection(1);
+        app.activate();
+        assert_eq!(app.pane, Pane::Memories);
+        assert_eq!(app.memories.len(), 2);
+        assert!(
+            app.tasks.iter().any(|t| t.contains("Ship the atlas TUI")),
+            "{:?}",
+            app.tasks
+        );
+
+        // Inspect the corrected memory.
+        let i = app.memories.iter().position(|m| m.rid == dana).unwrap();
+        app.mem_state.select(Some(i));
+        app.open_selected();
+        let ins = app.inspector.as_ref().unwrap();
+        assert!(ins.text.contains("Dana Okafor"));
+        assert!(
+            ins.entities.iter().any(|e| e == "Northwind Analytics"),
+            "{:?}",
+            ins.entities
+        );
+        assert!(
+            ins.claims
+                .iter()
+                .any(|c| c.contains("leads") && c.contains("Data Platform team")),
+            "{:?}",
+            ins.claims
+        );
+        assert_eq!(ins.revisions.len(), 1);
+        assert!(ins.revisions[0].contains("importance bump"));
+        assert!(ins.header.len() >= 3);
+    }
+
+    #[test]
+    fn search_returns_scored_hits_and_clearing_restores_the_listing() {
+        let (mut app, dana) = seeded("search");
+        app.query = "who leads the data platform team".into();
+        app.search();
+        assert!(app.active_query.is_some());
+        assert!(!app.memories.is_empty());
+        assert!(app.memories.iter().all(|m| m.score.is_some()));
+        assert!(
+            app.memories.iter().take(2).any(|m| m.rid == dana),
+            "Dana in the top two"
+        );
+        assert!(app.inspector.is_some(), "the top hit is opened");
+
+        app.query.clear();
+        app.active_query = None;
+        app.load_page(0);
+        assert!(app.memories.iter().all(|m| m.score.is_none()));
+        assert_eq!(app.memories.len(), 3);
+    }
+
+    /// Manual smoke against a real store, when one is named:
+    /// `YANTRIKDB_TUI_SMOKE_STORE=path cargo test -p yantrikdb-tui -- --nocapture smoke`
+    #[test]
+    fn smoke_opens_the_store_named_by_env() {
+        let Ok(path) = std::env::var("YANTRIKDB_TUI_SMOKE_STORE") else {
+            return;
+        };
+        let mut db = YantrikDB::with_default(&path).unwrap();
+        eprintln!("embedder: {}", attach_store_embedder(&mut db));
+        let mut app = App::new(db, path).unwrap();
+        eprintln!("namespaces: {:?}", app.namespaces);
+        eprintln!("first page: {} of {}", app.memories.len(), app.total);
+        app.query = "who leads the data platform team".into();
+        app.search();
+        for m in app.memories.iter().take(3) {
+            eprintln!(
+                "  hit {:.3}  {}",
+                m.score.unwrap_or(0.0),
+                first_line(&m.text, 70)
+            );
+        }
+        if let Some(ins) = &app.inspector {
+            eprintln!(
+                "inspector: entities={} claims={} revisions={}",
+                ins.entities.len(),
+                ins.claims.len(),
+                ins.revisions.len()
+            );
+            for c in &ins.claims {
+                eprintln!("  claim: {c}");
+            }
+            for r in &ins.revisions {
+                eprintln!("  revision: {}", r.replace('\n', " | "));
+            }
+        }
+        assert!(!app.namespaces.is_empty());
     }
 }
