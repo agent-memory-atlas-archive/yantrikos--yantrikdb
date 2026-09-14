@@ -709,6 +709,52 @@ def atlas(db_path, out_dir, label, serve, port, open_browser):
             pass
 
 
+# ── TUI launcher ──
+
+TUI_RELEASES_URL = "https://github.com/yantrikos/yantrikdb/releases"
+
+
+def _find_tui_binary():
+    """The `yantrikdb-tui` executable: on PATH, or beside this interpreter's
+    console scripts (where a user may drop a downloaded release binary)."""
+    import shutil
+
+    exe = "yantrikdb-tui.exe" if sys.platform.startswith("win") else "yantrikdb-tui"
+    found = shutil.which(exe)
+    if found:
+        return found
+    beside = Path(sys.executable).parent / exe
+    if beside.is_file():
+        return str(beside)
+    return None
+
+
+@cli.command(context_settings={"ignore_unknown_options": True})
+@click.argument("db_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("extra", nargs=-1, type=click.UNPROCESSED)
+def tui(db_path, extra):
+    """Open the terminal explorer (`yantrikdb-tui`) on ONE store.
+
+    The explorer is a Rust binary shipped with each release. It never opens
+    the store with the engine: it snapshots first and explores the copy, so
+    a live agent writing to the store is undisturbed. This launcher finds
+    the binary on PATH or beside this interpreter and runs it; if it is not
+    installed, it says where to get it instead of failing silently.
+    """
+    binary = _find_tui_binary()
+    if binary is None:
+        raise click.ClickException(
+            "yantrikdb-tui is not installed. Download the binary for your platform from "
+            f"{TUI_RELEASES_URL} and put it on your PATH (or beside this interpreter), "
+            "or build it from the repository with `cargo install --path crates/yantrikdb-tui`."
+        )
+    import subprocess
+
+    rc = subprocess.call([binary, str(Path(db_path).resolve()), *extra])
+    if rc != 0:
+        sys.exit(rc)
+
+
 def main():
     """Entry point for the yantrikdb CLI console script."""
     cli()

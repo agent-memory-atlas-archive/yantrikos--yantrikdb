@@ -1,0 +1,106 @@
+name: Release binaries (yantrikdb-tui)
+
+# On a version tag, build the terminal explorer for the platforms the wheels
+# cover and attach the binaries to the GitHub Release for that tag. The
+# Release itself is created by the release train (`gh release create`) before
+# this runs; action-gh-release uploads to an existing release for the tag.
+#
+# Distribution decision (2026-09-14): binaries as release assets first;
+# `yantrikdb tui <store.db>` in the Python CLI finds the binary on PATH or
+# beside the interpreter and otherwise points here. Publishing the crate to
+# crates.io (`cargo install yantrikdb-tui`) is a follow-up.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build yantrikdb-tui (${{ matrix.os_label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            os_label: linux-amd64
+          - os: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            os_label: linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            os_label: windows-amd64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+            os_label: macos-arm64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            ext: ""
+            os_label: macos-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-tui-release-${{ hashFiles('**/Cargo.toml') }}
+      - name: Build release binary
+        run: cargo build -p yantrikdb-tui --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/yantrikdb-tui${{ matrix.ext }}" "staging/yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}"
+          (cd staging && sha256sum "yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}" > "yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}.sha256")
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yantrikdb-tui-${{ matrix.os_label }}
+          path: staging/*
+
+  attach:
+    name: Attach binaries to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: List
+        run: find artifacts -type f | sort
+      - name: Wait for the release train to create the GitHub Release
+        # The train tags, pushes, then runs `gh release create`; this job must
+        # never create the release itself (that would make the train's create
+        # fail), so it waits for the release to exist before attaching.
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          for i in $(seq 1 60); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "release $TAG exists"; exit 0; fi
+            echo "release $TAG not yet created (attempt $i)"; sleep 20
+          done
+          echo "release $TAG never appeared; not attaching"; exit 1
+      - name: Attach to the GitHub Release for this tag
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/yantrikdb-tui-*
