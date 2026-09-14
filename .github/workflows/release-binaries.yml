@@ -15,6 +15,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the binaries to (e.g. v0.23.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -68,7 +73,10 @@ jobs:
         run: |
           mkdir -p staging
           cp "target/${{ matrix.target }}/release/yantrikdb-tui${{ matrix.ext }}" "staging/yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}"
-          (cd staging && sha256sum "yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}" > "yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}.sha256")
+          # macOS runners have shasum, not sha256sum
+          f="yantrikdb-tui-${{ matrix.os_label }}${{ matrix.ext }}"
+          (cd staging && { command -v sha256sum >/dev/null 2>&1 && sha256sum "$f" || shasum -a 256 "$f"; } > "$f.sha256")
+          cat "staging/$f.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -90,10 +98,9 @@ jobs:
         # The train tags, pushes, then runs `gh release create`; this job must
         # never create the release itself (that would make the train's create
         # fail), so it waits for the release to exist before attaching.
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           for i in $(seq 1 60); do
             if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "release $TAG exists"; exit 0; fi
@@ -103,4 +110,5 @@ jobs:
       - name: Attach to the GitHub Release for this tag
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/**/yantrikdb-tui-*
