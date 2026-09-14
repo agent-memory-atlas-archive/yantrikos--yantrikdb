@@ -22,6 +22,7 @@
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,6 +31,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use yantrikdb::engine::materializer::{
+    recommended_worker_count, spawn_all_workers, AllWorkerGuards,
+};
 use yantrikdb::YantrikDB;
 
 const PAGE_SIZE: usize = 200;
@@ -62,7 +66,13 @@ struct Inspector {
 }
 
 struct App {
-    db: YantrikDB,
+    /// Background workers (materializers + compactor) for the engine on the
+    /// COPY, exactly as the Python binding spawns them: without the
+    /// compactor the delta tier fills at 256 and pending materialization on
+    /// the copy would never run. Declared FIRST so they stop before the
+    /// engine drops.
+    workers: Option<AllWorkerGuards>,
+    db: Arc<YantrikDB>,
     store: String,
     namespaces: Vec<(String, i64)>,
     ns_state: ListState,
@@ -193,15 +203,43 @@ fn take_snapshot(source: &Path, guard: &SnapshotGuard) -> Result<PathBuf, Box<dy
     Ok(dest)
 }
 
-/// Snapshot, then construct the engine on the copy and attach the store's
-/// recorded embedder. Any failure returns through the guard, which removes
-/// whatever was copied.
-fn open_snapshot(source: &Path) -> Result<(YantrikDB, SnapshotGuard, SearchState), Box<dyn Error>> {
+/// Everything one snapshot needs: the engine on the copy (with its worker
+/// pool), the directory guard, and the search state.
+struct Opened {
+    db: Arc<YantrikDB>,
+    workers: AllWorkerGuards,
+    guard: SnapshotGuard,
+    search_state: SearchState,
+}
+
+/// Snapshot, construct the engine on the copy, attach the store's recorded
+/// embedder, spawn the engine's background workers. Any failure returns
+/// through the guard, which removes whatever was copied.
+fn open_snapshot(source: &Path) -> Result<Opened, Box<dyn Error>> {
     let guard = SnapshotGuard::create()?;
     let copy = take_snapshot(source, &guard)?;
     let mut db = YantrikDB::with_default(&copy.to_string_lossy())?;
     let search_state = attach_store_embedder(&mut db);
-    Ok((db, guard, search_state))
+    let db = Arc::new(db);
+    let workers = spawn_all_workers(&db, recommended_worker_count());
+    Ok(Opened {
+        db,
+        workers,
+        guard,
+        search_state,
+    })
+}
+
+/// Stop the workers, then close the engine: `close` consumes the engine, so
+/// the `Arc` must be unique; a worker mid-iteration can hold it a moment
+/// longer, in which case dropping our reference lets the last one close it.
+fn shutdown(workers: Option<AllWorkerGuards>, db: Arc<YantrikDB>) -> Result<(), Box<dyn Error>> {
+    drop(workers);
+    match Arc::try_unwrap(db) {
+        Ok(db) => db.close()?,
+        Err(shared) => drop(shared),
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -377,8 +415,14 @@ fn next_pane(p: Pane, forward: bool) -> Pane {
 impl App {
     /// Snapshot `source` and build the explorer on the copy.
     fn open(source: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let (db, snapshot, search_state) = open_snapshot(&source)?;
+        let Opened {
+            db,
+            workers,
+            guard: snapshot,
+            search_state,
+        } = open_snapshot(&source)?;
         let mut app = App {
+            workers: Some(workers),
             db,
             store: source.display().to_string(),
             namespaces: Vec::new(),
@@ -463,8 +507,13 @@ impl App {
     /// gives the same sequence on the panic path; this makes it explicit
     /// and reports a close failure.
     fn close(self) -> Result<(), Box<dyn Error>> {
-        let App { db, snapshot, .. } = self;
-        db.close()?;
+        let App {
+            workers,
+            db,
+            snapshot,
+            ..
+        } = self;
+        shutdown(workers, db)?;
         drop(snapshot);
         Ok(())
     }
@@ -601,10 +650,17 @@ impl App {
     /// falls back to all).
     fn refresh(&mut self) {
         match open_snapshot(&self.source) {
-            Ok((db, guard, search_state)) => {
-                // Close the old engine BEFORE its directory goes away.
+            Ok(Opened {
+                db,
+                workers,
+                guard,
+                search_state,
+            }) => {
+                // Stop the old workers and close the old engine BEFORE its
+                // directory goes away.
+                let old_workers = self.workers.replace(workers);
                 let old_db = std::mem::replace(&mut self.db, db);
-                let _ = old_db.close();
+                let _ = shutdown(old_workers, old_db);
                 let old_guard = std::mem::replace(&mut self.snapshot, guard);
                 drop(old_guard);
                 self.snapshot_at = now_secs();
@@ -1065,14 +1121,44 @@ mod tests {
         d
     }
 
+    /// A writer engine WITH its worker pool, as the Python binding constructs
+    /// one: without the compactor the delta tier fills at 256 and every
+    /// later write is refused with Backpressure forever (that was the
+    /// "engine stall" seen during this work). Derefs to the engine.
+    struct Writer {
+        workers: Option<AllWorkerGuards>,
+        db: Arc<YantrikDB>,
+    }
+
+    impl std::ops::Deref for Writer {
+        type Target = YantrikDB;
+        fn deref(&self) -> &YantrikDB {
+            &self.db
+        }
+    }
+
+    impl Writer {
+        fn close(self) {
+            let Writer { workers, db } = self;
+            shutdown(workers, db).unwrap();
+        }
+    }
+
     /// A writer engine on `path` at the bundled dimension: no model download
     /// in CI, and the store records the bundled embedder's identity.
-    fn writer(path: &Path) -> YantrikDB {
-        YantrikDB::new(
-            &path.to_string_lossy(),
-            yantrikdb::embedder::BUNDLED_EMBEDDER_DIM,
-        )
-        .unwrap()
+    fn writer(path: &Path) -> Writer {
+        let db = Arc::new(
+            YantrikDB::new(
+                &path.to_string_lossy(),
+                yantrikdb::embedder::BUNDLED_EMBEDDER_DIM,
+            )
+            .unwrap(),
+        );
+        let workers = spawn_all_workers(&db, recommended_worker_count());
+        Writer {
+            workers: Some(workers),
+            db,
+        }
     }
 
     /// Record one memory, honouring the engine's typed backpressure (the
@@ -1139,7 +1225,7 @@ mod tests {
         db.link_memory_entity(&dana, "Northwind Analytics").unwrap();
         db.task_add("work", "Ship the atlas TUI", "high", None)
             .unwrap();
-        db.close().unwrap();
+        db.close();
         (path, dana)
     }
 
@@ -1321,7 +1407,7 @@ mod tests {
         assert!(app.namespaces.iter().any(|(n, _)| n == "ops"));
         record(&w, "work", "The writer is undisturbed by the explorer.");
         app.close().unwrap();
-        w.close().unwrap();
+        w.close();
     }
 
     /// CONCURRENT writer: a background thread keeps committing rows while
@@ -1408,7 +1494,7 @@ mod tests {
         eprintln!("[concurrent] closed last snapshot engine; final write");
         record(&w, "work", "The writer is undisturbed by the explorer.");
         eprintln!("[concurrent] closing the writer");
-        w.close().unwrap();
+        w.close();
         eprintln!("[concurrent] writer closed");
     }
 
@@ -1433,7 +1519,7 @@ mod tests {
         record(&w, "aaa", "A new namespace appears.");
         w.task_add("planning", "Task-only namespace", "low", None)
             .unwrap();
-        w.close().unwrap();
+        w.close();
 
         let first_dir = app.snapshot.dir.clone();
         app.refresh();
@@ -1592,6 +1678,21 @@ mod tests {
                 apps.push(App::open(path.clone()).unwrap());
                 mark(format!("opened snapshot {k}: total {}", apps[k].total));
             }
+            // Keep the writer saturated for a while after the backups: the
+            // stalls seen during development came under SUSTAINED
+            // backpressure (hundreds of retry hits), not from a brief burst.
+            let t0 = std::time::Instant::now();
+            while backpressure_hits.load(Ordering::Relaxed) < 300
+                && t0.elapsed() < Duration::from_secs(8)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            mark(format!(
+                "sustained phase over: written {}, backpressure hits {} in {:.1}s",
+                written.load(Ordering::Relaxed),
+                backpressure_hits.load(Ordering::Relaxed),
+                t0.elapsed().as_secs_f64()
+            ));
             stop.store(true, Ordering::Relaxed);
             mark("stop set; waiting for the writer thread (it is inside record_text or its retry sleep)".into());
         });
@@ -1605,7 +1706,7 @@ mod tests {
             app.close().unwrap();
         }
         mark("closing the writer".into());
-        w.close().unwrap();
+        w.close();
         mark("done".into());
     }
 
