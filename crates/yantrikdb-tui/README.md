@@ -33,7 +33,11 @@ Keys: `Tab`/`Shift-Tab` move between panes, `↑`/`↓` or `j`/`k` move,
   then builds the engine on that private copy. The source's bytes, journal
   mode and schema stamp stay as they were; an agent writing to it from
   another process is undisturbed; `r` takes a fresh snapshot, and the
-  header shows when the current one was taken.
+  header shows when the current one was taken. The copy lives in a private
+  temporary directory that is removed on exit, on refresh and on every
+  failure path; a process killed outright, or a removal that fails, can
+  leave that directory behind (its name carries the process id and is
+  never reused).
 - **Non-reinforcing reads on the copy.** `recall(..., skip_reinforce =
   true, ...)`, `list_memories`, `get` and the `engine::inspect` reads.
 - **Searches with the store's own model, verified.** It reads the embedder

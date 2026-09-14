@@ -105,10 +105,13 @@ fn now_secs() -> f64 {
 
 /// A private, EXCLUSIVELY created directory that owns one snapshot copy.
 ///
-/// Dropping the guard removes the directory, so a copy never outlives the
-/// explorer: on normal exit, on refresh, and on every error path of
-/// `take_snapshot`/`open_snapshot` (the guard is created first and any
-/// failure returns through it). The engine on the copy must be closed
+/// Dropping the guard removes the directory: on normal exit, on refresh,
+/// and on every error path of `take_snapshot`/`open_snapshot` (the guard is
+/// created first and any failure returns through it). Removal is best
+/// effort: a process killed outright never runs Drop, and a removal that
+/// still fails after the retries leaves the directory; either way it carries
+/// the dead process's id in its name and is never reused, because names are
+/// random and created exclusively. The engine on the copy must be closed
 /// before the guard drops; `App` declares the engine before the guard so
 /// field-drop order does that on the panic path, and `App::close`/`refresh`
 /// do it explicitly.
@@ -1504,6 +1507,106 @@ mod tests {
         drop(a);
         drop(b);
         assert!(!da.exists() && !db_.exists());
+    }
+
+    /// ENGINE STALL REPRODUCER (ignored by default; an engine finding, not
+    /// an explorer property). The exact loop that produced two stalls on
+    /// Windows during this work: a single writer that SATURATES the
+    /// engine's backpressure limit and retries on `retry_after_ms`, while
+    /// three snapshots are taken, then teardown. A watchdog prints the last
+    /// phase marker and aborts after 60 s so a stall is located, not merely
+    /// waited out. Run repeatedly:
+    /// `cargo test -p yantrikdb-tui -- --ignored --nocapture engine_stall`
+    #[test]
+    #[ignore]
+    fn engine_stall_repro_unthrottled_writer() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let phase = Arc::new(Mutex::new(String::from("start")));
+        let mark = {
+            let phase = phase.clone();
+            move |m: String| {
+                eprintln!("[stall {:>8.3}s] {m}", now_secs() % 1000.0);
+                *phase.lock().unwrap() = m;
+            }
+        };
+        // Watchdog: abort the whole process with the last phase after 60 s.
+        {
+            let phase = phase.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                eprintln!(
+                    "[stall] WATCHDOG: still running after 60 s; last phase = {}",
+                    phase.lock().unwrap()
+                );
+                std::process::abort();
+            });
+        }
+        let path = temp_dir("stall").join("source.db");
+        let w = writer(&path);
+        mark("seed".into());
+        for i in 0..20 {
+            record(&w, "work", &format!("Seed row {i}."));
+        }
+        let stop = AtomicBool::new(false);
+        let written = AtomicUsize::new(20);
+        let backpressure_hits = AtomicUsize::new(0);
+        let mut apps: Vec<App> = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut i = 20;
+                while !stop.load(Ordering::Relaxed) {
+                    // UNTHROTTLED: exactly the loop that stalled.
+                    match w.record_text(
+                        &format!("Concurrent row {i}."),
+                        "semantic",
+                        0.6,
+                        0.0,
+                        604800.0,
+                        &serde_json::json!({}),
+                        "work",
+                        0.8,
+                        "general",
+                        "user",
+                        None,
+                    ) {
+                        Ok(_) => {
+                            written.fetch_add(1, Ordering::Relaxed);
+                            i += 1;
+                        }
+                        Err(yantrikdb::YantrikDbError::Backpressure { retry_after_ms, .. }) => {
+                            backpressure_hits.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(retry_after_ms));
+                        }
+                        Err(e) => panic!("writer failed: {e}"),
+                    }
+                }
+                *phase.lock().unwrap() = "writer loop exited".into();
+            });
+            for k in 0..3 {
+                mark(format!(
+                    "opening snapshot {k} (written {}, backpressure hits {})",
+                    written.load(Ordering::Relaxed),
+                    backpressure_hits.load(Ordering::Relaxed)
+                ));
+                apps.push(App::open(path.clone()).unwrap());
+                mark(format!("opened snapshot {k}: total {}", apps[k].total));
+            }
+            stop.store(true, Ordering::Relaxed);
+            mark("stop set; waiting for the writer thread (it is inside record_text or its retry sleep)".into());
+        });
+        mark(format!(
+            "writer thread joined; written {}, backpressure hits {}",
+            written.load(Ordering::Relaxed),
+            backpressure_hits.load(Ordering::Relaxed)
+        ));
+        for (k, app) in apps.into_iter().enumerate() {
+            mark(format!("closing snapshot engine {k}"));
+            app.close().unwrap();
+        }
+        mark("closing the writer".into());
+        w.close().unwrap();
+        mark("done".into());
     }
 
     /// Manual smoke against a real store, when one is named:
