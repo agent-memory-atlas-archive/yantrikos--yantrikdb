@@ -85,4 +85,18 @@ class ExportTests(unittest.TestCase):
             self.assertIn('encrypted', str(ctx.exception))
             self.assertFalse((base/'site/data.json').exists())
 
+    def test_refresh_replaces_a_symlinked_artifact_and_leaves_its_target_alone(self):
+        import os
+        with tempfile.TemporaryDirectory() as temp:
+            base=Path(temp); c,stores=self.fixture(base); c.commit(); c.close()
+            site=base/'site'; site.mkdir()
+            target=base/'elsewhere.json'; target.write_text('{"untouched": true}', encoding='utf-8')
+            try: os.symlink(target, site/'data.json')
+            except (OSError, NotImplementedError): self.skipTest('symlinks not available here')
+            with contextlib.redirect_stdout(io.StringIO()): export(stores,site)
+            self.assertFalse((site/'data.json').is_symlink(), 'the link is replaced, not followed')
+            self.assertEqual(target.read_text(encoding='utf-8'), '{"untouched": true}')
+            self.assertIn('memories', json.loads((site/'data.json').read_bytes()))
+            self.assertEqual([p.name for p in site.iterdir() if p.name.startswith('.')], [], 'no temp files left behind')
+
 if __name__=='__main__': unittest.main()

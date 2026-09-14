@@ -20,6 +20,18 @@ def digest(path):
     return h.hexdigest()
 
 
+
+def _serve_module():
+    """Load the sibling serve.py BY PATH: this script runs in a child process
+    that must never import the `yantrikdb` package (its __init__ loads the
+    native engine), so no package-relative import here. serve.py is stdlib
+    only."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('yantrikdb_atlas_serve', Path(__file__).with_name('serve.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 def export(stores, out, label=None):
     # A single .db FILE exports exactly that store; a DIRECTORY exports every
     # .db in it. Never widen a file to its parent directory: a store's
@@ -123,13 +135,14 @@ def export(stores, out, label=None):
             raise RuntimeError(f'Source changed during export: {path}. Retry after the writer settles.')
         data['sources'].append({'store': path.name, 'sha256': before, 'unchanged_after_read': True})
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'data.json').write_text(json.dumps(data, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
-    (out / 'index.html').write_bytes(Path(__file__).with_name('index.html').read_bytes())
+    write_artifact = _serve_module().write_artifact  # atomic temp + os.replace
+    write_artifact(out / 'data.json', json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    write_artifact(out / 'index.html', Path(__file__).with_name('index.html').read_bytes())
     summary = {k: len(data[k]) for k in ('groups','memories','claims','memberships','sources','revisions','tasks')}
     summary['exported_at'] = data['exported_at']
     summary['source_db_hashes_unchanged'] = True
     summary['model_calls'] = 0
-    (out / 'export-report.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    write_artifact(out / 'export-report.json', json.dumps(summary, indent=2).encode('utf-8'))
     print(json.dumps(summary, indent=2))
 
 

@@ -120,3 +120,54 @@ def test_directory_listing_is_never_produced(served):
     # A plain SimpleHTTPRequestHandler would list `sub/`; ours must not.
     status, body = _get(served + "sub/")
     assert status == 404 and b"Directory listing" not in body
+
+
+def _symlink(src: Path, dst: Path):
+    try:
+        os.symlink(src, dst)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available here")
+
+
+def test_symlinked_artifact_is_refused_same_root_and_outside_root(tmp_path):
+    """`index.html -> unrelated.txt` passed a parent check and served the
+    target (review finding); a link to a file outside the directory would
+    serve that. Both must be 404, by name and by the refused artifact."""
+    out = tmp_path / "export"
+    out.mkdir()
+    (out / "unrelated.txt").write_text("must never be served", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    _symlink(out / "unrelated.txt", out / "index.html")
+    _symlink(outside, out / "data.json")
+    (out / "export-report.json").write_text("{}", encoding="utf-8")
+    httpd, url = serve_in_background(out)
+    try:
+        for path in ("", "index.html", "data.json"):
+            status, body = _get(url + path)
+            assert status == 404, path
+            assert b"must never be served" not in body and b"outside secret" not in body
+        assert _get(url + "export-report.json")[0] == 200, "the regular artifact still serves"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_out_dir_with_a_symlinked_artifact_is_not_atlas_owned(tmp_path):
+    store = tmp_path / "memory.db"
+    store.write_bytes(b"x")
+    out = tmp_path / "export"
+    out.mkdir()
+    (out / "export-report.json").write_text("{}", encoding="utf-8")
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}", encoding="utf-8")
+    _symlink(target, out / "data.json")
+    with pytest.raises(ValueError, match="symlink or not a regular file"):
+        atlas_out_dir(out, store)
+    # A symlinked REPORT means nothing here is ours either.
+    out2 = tmp_path / "export2"
+    out2.mkdir()
+    _symlink(target, out2 / "export-report.json")
+    (out2 / "note.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="not an atlas export directory"):
+        atlas_out_dir(out2, store)

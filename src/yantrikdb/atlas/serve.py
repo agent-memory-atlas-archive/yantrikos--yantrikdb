@@ -19,6 +19,7 @@ Standard library only; this module must not import the engine.
 """
 from __future__ import annotations
 
+import os
 import posixpath
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -51,13 +52,52 @@ def atlas_out_dir(out: Path, store: Path) -> Path:
         if not out_r.is_dir():
             raise ValueError(f"{out_r} exists and is not a directory")
         entries = [p.name for p in out_r.iterdir()]
-        if entries and not (out_r / REPORT).is_file():
+        if entries and not artifact_is_regular(out_r, REPORT):
             raise ValueError(
                 f"{out_r} exists, is not empty and is not an atlas export directory "
-                f"(no {REPORT}); choose an empty or atlas-owned directory so nothing "
-                "unrelated is overwritten or served"
+                f"(no regular {REPORT}); choose an empty or atlas-owned directory so "
+                "nothing unrelated is overwritten or served"
             )
+        # Ownership means the artifacts are OUR regular files. A symlinked
+        # artifact would be followed by a refresh and served by the server.
+        for name in ARTIFACTS:
+            candidate = out_r / name
+            if (candidate.is_symlink() or candidate.exists()) and not artifact_is_regular(out_r, name):
+                raise ValueError(
+                    f"{candidate} is a symlink or not a regular file; refusing to refresh "
+                    "or serve an export directory whose artifacts are not its own files"
+                )
     return out_r
+
+
+def artifact_is_regular(root: Path, name: str) -> bool:
+    """True when ``root/name`` is a regular file (not a symlink) that
+    resolves to exactly itself inside ``root``."""
+    candidate = Path(root) / name
+    if candidate.is_symlink():
+        return False
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved == Path(root).resolve() / name and resolved.is_file()
+
+
+def write_artifact(path: Path, data: bytes) -> None:
+    """Write an artifact atomically: temp file beside it, then ``os.replace``.
+
+    ``os.replace`` swaps the directory entry, so a symlink at ``path`` is
+    replaced rather than followed (no target file is ever modified) and a
+    server already serving the directory never sees a partially written
+    file.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def make_handler(out_dir: Path):
@@ -68,7 +108,15 @@ def make_handler(out_dir: Path):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(root), **kwargs)
 
-        def _artifact(self) -> Path | None:
+        def _artifact(self) -> str | None:
+            """The canonical artifact NAME to serve, or None (404).
+
+            Only an allowlisted name that is a regular file living directly
+            in the export directory qualifies. A symlinked artifact is
+            rejected outright: `index.html -> unrelated.txt` would otherwise
+            pass a parent check and serve the link's target, and a link to
+            a file outside the directory would serve that.
+            """
             # Strip query/fragment, normalise, map "/" to the page.
             raw = self.path.split("?", 1)[0].split("#", 1)[0]
             name = posixpath.normpath(raw).lstrip("/")
@@ -76,30 +124,22 @@ def make_handler(out_dir: Path):
                 name = "index.html"
             if name not in ARTIFACTS:
                 return None
-            target = (root / name)
-            try:
-                resolved = target.resolve(strict=True)
-            except OSError:
-                return None
-            # No symlink escapes: the served file must live directly in root.
-            if resolved.parent != root:
-                return None
-            return resolved
+            return name if artifact_is_regular(root, name) else None
 
         def do_GET(self):  # noqa: N802 (http.server naming)
-            target = self._artifact()
-            if target is None:
+            name = self._artifact()
+            if name is None:
                 self.send_error(404, "not an atlas artifact")
                 return
-            self.path = "/" + target.name
+            self.path = "/" + name
             super().do_GET()
 
         def do_HEAD(self):  # noqa: N802
-            target = self._artifact()
-            if target is None:
+            name = self._artifact()
+            if name is None:
                 self.send_error(404, "not an atlas artifact")
                 return
-            self.path = "/" + target.name
+            self.path = "/" + name
             super().do_HEAD()
 
         def list_directory(self, path):  # never
