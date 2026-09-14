@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from yantrikdb.atlas.serve import ARTIFACTS, atlas_out_dir, serve_in_background
+from yantrikdb.atlas.serve import ARTIFACTS, atlas_out_dir, serve_in_background, write_artifact
 
 
 def _get(url: str):
@@ -171,3 +171,38 @@ def test_out_dir_with_a_symlinked_artifact_is_not_atlas_owned(tmp_path):
     (out2 / "note.txt").write_text("x", encoding="utf-8")
     with pytest.raises(ValueError, match="not an atlas export directory"):
         atlas_out_dir(out2, store)
+
+
+# ── write_artifact ───────────────────────────────────────────────────
+
+
+def test_write_never_uses_a_predictable_temp_name(tmp_path):
+    """A hard link planted at the old predictable temp path
+    (`.<name>.tmp-<pid>`) must not receive the bytes (review finding)."""
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("must stay", encoding="utf-8")
+    planted = tmp_path / f".data.json.tmp-{os.getpid()}"
+    try:
+        os.link(unrelated, planted)
+    except (OSError, NotImplementedError):
+        planted.write_text("must stay", encoding="utf-8")  # a plain file works for the assertion too
+    write_artifact(tmp_path / "data.json", b'{"fresh": true}')
+    assert unrelated.read_text(encoding="utf-8") == "must stay"
+    assert planted.read_text(encoding="utf-8") == "must stay"
+    assert (tmp_path / "data.json").read_bytes() == b'{"fresh": true}'
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == [], "no temp files left"
+
+
+def test_write_failure_leaves_no_temp_file(tmp_path):
+    target = tmp_path / "data.json"
+    target.mkdir()  # os.replace onto a directory fails
+    with pytest.raises(OSError):
+        write_artifact(target, b"x")
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []
+
+
+def test_repeated_writes_in_one_process_leave_no_leftovers(tmp_path):
+    for i in range(3):
+        write_artifact(tmp_path / "export-report.json", f'{{"n": {i}}}'.encode())
+    assert (tmp_path / "export-report.json").read_bytes() == b'{"n": 2}'
+    assert [p.name for p in tmp_path.iterdir()] == ["export-report.json"]

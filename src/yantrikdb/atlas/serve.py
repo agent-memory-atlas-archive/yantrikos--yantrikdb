@@ -84,20 +84,33 @@ def artifact_is_regular(root: Path, name: str) -> bool:
 
 
 def write_artifact(path: Path, data: bytes) -> None:
-    """Write an artifact atomically: temp file beside it, then ``os.replace``.
+    """Write an artifact atomically: exclusive temp file beside it, then
+    ``os.replace``.
 
-    ``os.replace`` swaps the directory entry, so a symlink at ``path`` is
-    replaced rather than followed (no target file is ever modified) and a
-    server already serving the directory never sees a partially written
-    file.
+    The temp file is created by ``tempfile.mkstemp`` (``O_EXCL``, random
+    name), never at a predictable path: a hard link or symlink planted at a
+    guessable name would otherwise redirect the write into some other file
+    (review finding on yantrikos/yantrikdb#232). ``os.replace`` swaps the
+    directory entry, so a symlink at ``path`` is replaced rather than
+    followed and a server already serving the directory never sees a
+    partially written file. On any failure the temp file is removed.
     """
+    import tempfile
+
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def make_handler(out_dir: Path):
