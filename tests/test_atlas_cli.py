@@ -113,3 +113,41 @@ def test_encrypted_store_is_refused_with_a_plain_message(tmp_path):
     r = CliRunner().invoke(cli, ["atlas", str(enc), "--out", str(tmp_path / "s"), "--no-serve"])
     assert r.exit_code != 0
     assert "encrypted" in r.output and "Traceback" not in r.output
+
+
+# ── `yantrikdb tui` launcher ─────────────────────────────────────────
+
+
+def test_tui_launcher_says_where_to_get_the_binary_when_missing(tmp_path, monkeypatch):
+    import yantrikdb.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_find_tui_binary", lambda: None)
+    db = _fixture(tmp_path)
+    r = CliRunner().invoke(cli, ["tui", str(db)])
+    assert r.exit_code != 0
+    assert "yantrikdb-tui is not installed" in r.output
+    assert cli_mod.TUI_RELEASES_URL in r.output and "cargo install" in r.output
+
+
+def test_tui_launcher_runs_the_binary_on_the_resolved_store_path(tmp_path, monkeypatch):
+    import subprocess as sp
+    import yantrikdb.cli as cli_mod
+
+    seen = {}
+    monkeypatch.setattr(cli_mod, "_find_tui_binary", lambda: "/fake/bin/yantrikdb-tui")
+    monkeypatch.setattr(sp, "call", lambda argv: seen.setdefault("argv", argv) and 0)
+    db = _fixture(tmp_path)
+    r = CliRunner().invoke(cli, ["tui", str(db)])
+    assert r.exit_code == 0, r.output
+    assert seen["argv"] == ["/fake/bin/yantrikdb-tui", str(db.resolve())]
+
+
+def test_tui_launcher_propagates_the_binary_exit_code(tmp_path, monkeypatch):
+    import subprocess as sp
+    import yantrikdb.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_find_tui_binary", lambda: "/fake/bin/yantrikdb-tui")
+    monkeypatch.setattr(sp, "call", lambda argv: 3)
+    db = _fixture(tmp_path)
+    r = CliRunner().invoke(cli, ["tui", str(db)])
+    assert r.exit_code == 3
