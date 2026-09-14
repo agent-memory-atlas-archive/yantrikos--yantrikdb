@@ -569,6 +569,48 @@ namespace-scoped but remains linkable and must not be treated as anonymized.
 | **Thread safety** | Mutex/RwLock, Send+Sync | Safe concurrent access from multiple threads |
 | **Query interface** | Cognitive operations API | Not SQL — designed for how agents think |
 
+## Look inside a store
+
+Two read-only tools ship with the engine. Neither needs a running server, and
+neither changes the store it reads.
+
+**Terminal explorer** — `yantrikdb-tui` opens one store in three panes:
+namespaces with live counts, memories newest-first or by semantic search, and
+an inspector with the text, metadata, linked entities, the claims that memory
+backs, its revision history, and the namespace's tasks.
+
+```bash
+yantrikdb tui /path/to/memory.db
+```
+
+It is safe to point at a store an agent is writing to right now. An ordinary
+engine open is not a read — it can switch the journal to WAL, migrate the
+schema and backfill — so the explorer never opens the source with the engine.
+It takes a consistent SQLite online-backup copy through a read-only connection
+into a private temporary directory, builds the engine on the **copy**, and
+removes it on exit, on refresh (`r`) and on every failure path. Search uses the
+model the store recorded, verified by digest; anything short of a verified
+match disables search and says why.
+
+`yantrikdb tui` launches the binary if it is installed. Download it for your
+platform from the [latest release](https://github.com/yantrikos/yantrikdb/releases)
+(each asset has a `.sha256` sidecar; linux-amd64, linux-arm64, windows-amd64,
+macos-arm64, macos-amd64) or build it with
+`cargo install --path crates/yantrikdb-tui`.
+
+**Memory Atlas** — a static page that renders the whole store as a graph:
+namespaces as spheres, memories as dots, stored entity links as lines, with
+claims, revisions and tasks in the inspector.
+
+```bash
+yantrikdb atlas /path/to/memory.db      # exports, then serves it on 127.0.0.1
+```
+
+The export runs in a child process that never loads the engine, hashes the file
+before and after reading and refuses if it changed underneath, makes zero model
+calls, and writes exactly three artifacts. Encrypted stores are refused: it
+reads raw rows and cannot decrypt them. [Sample atlas and guide →](https://yantrikdb.com/guides/memory-atlas/)
+
 ## Ecosystem
 
 This repo is the engine. The rest of the stack builds on it:
