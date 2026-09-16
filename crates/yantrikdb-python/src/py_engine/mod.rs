@@ -890,29 +890,43 @@ impl PyYantrikDB {
     }
 
     pub(crate) fn embed_text(&self, py: Python<'_>, text: &str) -> PyResult<Vec<f32>> {
-        // Try Rust-native embedder first (candle or any Embedder impl)
+        // **An embedder the caller ATTACHED wins over one the engine merely
+        // resolved for this store's dimension** (yantrikdb-hermes-plugin #84).
+        //
+        // This used to try the native embedder first. The wheel ships
+        // `embedder-download`, so a store opened at 256 dims already has the
+        // bundled potion-base-8M attached natively — and every
+        // `set_embedder(obj)` whose model happened to be 256-d was therefore
+        // discarded in silence. The caller's model never ran, nothing raised,
+        // and the vectors came from a model they did not choose: someone who
+        // picked a multilingual model to hold non-English memories got
+        // English-centric vectors with no way to notice.
+        //
+        // Precedence is now intent-ordered. An explicit `set_embedder(obj)`
+        // (or `embedder=` on the constructor) states which space this store's
+        // vectors live in, so it outranks a default the engine attached on the
+        // caller's behalf. Space-mixing stays guarded: `set_embedder` runs
+        // `check_embedder_identity` before accepting the object, so attaching
+        // one to a store with a recorded identity is refused as before.
+        if let Some(emb) = &self.embedder {
+            let result = emb.call_method1(py, "encode", (text,))?;
+            // Handle both list and numpy array returns
+            if let Ok(list) = result.extract::<Vec<f32>>(py) {
+                return Ok(list);
+            }
+            // Try calling .tolist() for numpy arrays
+            let list = result.call_method0(py, "tolist")?;
+            return list.extract::<Vec<f32>>(py);
+        }
+
         if let Some(db) = &self.inner {
             if db.has_embedder() {
                 return db.embed(text).map_err(map_err);
             }
         }
 
-        // Fall back to Python embedder
-        match &self.embedder {
-            Some(emb) => {
-                let result = emb.call_method1(py, "encode", (text,))?;
-                // Handle both list and numpy array returns
-                if let Ok(list) = result.extract::<Vec<f32>>(py) {
-                    Ok(list)
-                } else {
-                    // Try calling .tolist() for numpy arrays
-                    let list = result.call_method0(py, "tolist")?;
-                    list.extract::<Vec<f32>>(py)
-                }
-            }
-            None => Err(PyRuntimeError::new_err(
-                "No embedder configured. Pass an embedder to YantrikDB() or call set_embedder().",
-            )),
-        }
+        Err(PyRuntimeError::new_err(
+            "No embedder configured. Pass an embedder to YantrikDB() or call set_embedder().",
+        ))
     }
 }

@@ -79,7 +79,10 @@ impl PyYantrikDB {
                     created_at,
                 )
                 .map_err(map_err),
-            None if db.has_embedder() => db
+            // Only let the engine embed when the caller attached nothing of
+            // their own — an explicit Python embedder outranks a default the
+            // engine resolved for this dimension (#84).
+            None if db.has_embedder() && self.embedder.is_none() => db
                 .record_text_with_idempotency(
                     text,
                     memory_type,
@@ -879,7 +882,7 @@ impl PyYantrikDB {
         // embedder) and hand the vector to `correct_with_embedding`. When a
         // native embedder exists we let the engine embed (it also handles the
         // reembed-cutover revalidation loop natively).
-        let use_caller_embed = new_text.is_some() && !db.has_embedder() && self.embedder.is_some();
+        let use_caller_embed = new_text.is_some() && self.embedder.is_some();
         let result = if use_caller_embed {
             // sol r8: snapshot the search generation BEFORE embedding so the
             // vector is pinned to the space it is computed in. If a reembed
