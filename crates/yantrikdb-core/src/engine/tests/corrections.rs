@@ -1310,3 +1310,154 @@ fn forget_deletes_durable_entity_links() {
         .unwrap();
     assert_eq!(after, 0, "durable entity links must die with the record");
 }
+
+// ── Claims coherence: the correction safety half for the claims lane ──
+
+/// A correction that removes a stated claim's grounding must stop that claim
+/// being served as CURRENT, and must say so on the live `get_claims()` path —
+/// not merely in the table. The gap this closes: `attach_claims` admits a
+/// claim because both endpoints occur in the memory's text, `correct()` then
+/// rewrote the text out from under it, and the claim stayed `valid_to` NULL
+/// with `status_suggestion = "active"` next to its own replacement.
+#[test]
+fn correct_closes_the_window_on_claims_whose_grounding_left_the_text() {
+    use crate::engine::graph_ops::StatedClaim;
+
+    let db = YantrikDB::with_default(":memory:").unwrap();
+    let rid = db
+        .record_text(
+            "Dana Okafor leads the Data Platform team at Northwind.",
+            "semantic",
+            0.7,
+            0.0,
+            604800.0,
+            &empty_meta(),
+            "default",
+            0.9,
+            "work",
+            "user",
+            None,
+        )
+        .unwrap();
+
+    // Two stated claims, both grounded in the original text.
+    let report = db
+        .attach_claims(
+            &rid,
+            &[
+                StatedClaim {
+                    src: "Dana Okafor".to_string(),
+                    rel_type: "leads".to_string(),
+                    dst: "Data Platform".to_string(),
+                    ..Default::default()
+                },
+                StatedClaim {
+                    src: "Dana Okafor".to_string(),
+                    rel_type: "works_at".to_string(),
+                    dst: "Northwind".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        report.accepted.len(),
+        2,
+        "both claims should ground: {report:?}"
+    );
+
+    let status_of = |dst: &str| -> String {
+        db.get_claims("Dana Okafor", None)
+            .unwrap()
+            .into_iter()
+            .find(|c| c["dst"] == dst)
+            .unwrap_or_else(|| panic!("claim to {dst} missing from get_claims"))
+            ["status_suggestion"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(status_of("Data Platform"), "active");
+    assert_eq!(status_of("Northwind"), "active");
+
+    // The correction drops "Data Platform" from the text but KEEPS "Northwind".
+    db.correct(
+        &rid,
+        Some("Dana Okafor leads the ML Platform team at Northwind."),
+        None,
+        None,
+        None,
+        "role change confirmed",
+    )
+    .unwrap();
+
+    // Ungrounded claim: no longer current, but NOT erased — a correction is a
+    // record of when a belief ended, so the row and its history survive.
+    let lost = status_of("Data Platform");
+    assert!(
+        lost == "historical" || lost == "superseded",
+        "claim whose object left the text must stop being active, got {lost}"
+    );
+    let still_there = db
+        .get_claims("Dana Okafor", None)
+        .unwrap()
+        .into_iter()
+        .find(|c| c["dst"] == "Data Platform")
+        .expect("closed claim must still be readable, not tombstoned");
+    assert!(
+        still_there["valid_to"].as_f64().is_some(),
+        "closing sets valid_to rather than deleting: {still_there}"
+    );
+
+    // Claim still grounded in the corrected text is untouched.
+    assert_eq!(
+        status_of("Northwind"),
+        "active",
+        "a claim whose endpoints survive the correction must stay current"
+    );
+}
+
+/// `relate()` edges carry no `source_memory_rid`, so a correction elsewhere
+/// must never close them — the scope of the safety half is this memory's own
+/// provenance, nothing wider.
+#[test]
+fn correct_leaves_manual_relate_edges_alone() {
+    let db = YantrikDB::with_default(":memory:").unwrap();
+    let rid = db
+        .record_text(
+            "Volkan ships the salt marsh report.",
+            "semantic",
+            0.5,
+            0.0,
+            604800.0,
+            &empty_meta(),
+            "default",
+            0.8,
+            "general",
+            "user",
+            None,
+        )
+        .unwrap();
+    db.relate("Volkan", "Aurelian", "works_with", 1.0).unwrap();
+
+    db.correct(
+        &rid,
+        Some("The report was filed by someone else entirely."),
+        None,
+        None,
+        None,
+        "reassigned",
+    )
+    .unwrap();
+
+    let edge = db
+        .get_claims("Volkan", None)
+        .unwrap()
+        .into_iter()
+        .find(|c| c["rel_type"] == "works_with")
+        .expect("manual edge must survive");
+    assert!(
+        edge["valid_to"].is_null(),
+        "a correction must not close an edge it never sourced: {edge}"
+    );
+}

@@ -1320,6 +1320,83 @@ impl YantrikDB {
         Ok(())
     }
 
+    /// **Claims coherence — the correction "safety half" for the claims lane.**
+    /// A text-changing `correct()` re-embeds the vector and drops stale entity
+    /// links, but the claims this memory spawned were grounded against the OLD
+    /// text: `attach_claims` admits a stated claim only because both endpoints
+    /// occur in the source text. A correction can remove that grounding, or
+    /// contradict the claim outright, and until now nothing re-checked it — so
+    /// `get_claims()` kept serving the contradicted fact as current
+    /// (`status_suggestion = "active"`, `valid_to` NULL) beside its own
+    /// replacement.
+    ///
+    /// CLOSE the world-validity window (`valid_to = applied_at`) rather than
+    /// tombstoning. The claim *was* believed, and the correction is precisely
+    /// the record of when it stopped being: `get_claims` then derives
+    /// "historical"/"superseded" instead of "active", `recall_as_of` can still
+    /// see it was current beforehand, and the `record_revisions` row says why
+    /// it closed. Tombstoning would erase exactly the history a correction
+    /// exists to preserve.
+    ///
+    /// Matching reuses the SAME word-boundary matcher as the entity half
+    /// (`graph::entity_matches_text` over `graph::tokenize`) and for the same
+    /// reason: a false-KEEP silently preserves the harm while the code looks
+    /// like it ran, whereas a false-CLOSE is benign — the claim stays readable,
+    /// it just stops being current. Err toward closing.
+    ///
+    /// Scope is deliberately narrow:
+    /// - only rows whose `source_memory_rid` is THIS memory, so `relate()`
+    ///   edges (which carry no provenance rid) and claims spawned by other
+    ///   memories keep their own grounding;
+    /// - only rows still open (`valid_to IS NULL`), so a window closed earlier
+    ///   — by succession, by the writer, by a previous correction — is never
+    ///   rewritten to a later instant;
+    /// - re-extracting claims from the corrected text is the deferrable
+    ///   "completeness half" and is intentionally NOT done here, exactly as
+    ///   for entities.
+    ///
+    /// Runs inside the correction's transaction so the closure is atomic with
+    /// the text change, and is mirrored on the replication apply path — a
+    /// follower that skipped it would serve a contradicted claim as current
+    /// while the leader did not.
+    fn close_ungrounded_claims_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        rid: &str,
+        new_text_plain: &str,
+        applied_at: f64,
+    ) -> Result<usize> {
+        let open: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT claim_id, src, dst FROM claims                  WHERE source_memory_rid = ?1 AND tombstoned = 0 AND valid_to IS NULL",
+            )?;
+            let rows = stmt.query_map(params![rid], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if open.is_empty() {
+            return Ok(0);
+        }
+        let tokens = crate::graph::tokenize(new_text_plain);
+        let mut closed = 0usize;
+        for (claim_id, src, dst) in &open {
+            let still_grounded = crate::graph::entity_matches_text(src, &tokens)
+                && crate::graph::entity_matches_text(dst, &tokens);
+            if !still_grounded {
+                tx.execute(
+                    "UPDATE claims SET valid_to = ?2 WHERE claim_id = ?1",
+                    params![claim_id, applied_at],
+                )?;
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
     /// **Entity-graph coherence — in-memory index eviction (nuron live-verify
     /// finding, v0.10 Item-3 follow-up).** `drop_stale_memory_entity_links_in_tx`
     /// deletes the DURABLE `memory_entities` rows, but recall's `expand_entities`
@@ -1911,6 +1988,9 @@ impl YantrikDB {
                         )?;
                     }
                     Self::drop_stale_memory_entity_links_in_tx(&tx, rid, new_text)?;
+                    // Claims half of the same coherence fix: close the window on
+                    // claims this memory spawned whose endpoints left the text.
+                    Self::close_ungrounded_claims_in_tx(&tx, rid, new_text, ts)?;
                     self.insert_correct_op_in_tx(
                         &tx,
                         rid,
@@ -2452,6 +2532,10 @@ impl YantrikDB {
                 // corrected text just like the leader's.
                 if let Some(t) = new_text {
                     Self::drop_stale_memory_entity_links_in_tx(&tx, rid, t)?;
+                    // Claims half — mirror the leader here too, or a follower
+                    // serves a contradicted claim as current while the leader
+                    // does not.
+                    Self::close_ungrounded_claims_in_tx(&tx, rid, t, applied_at)?;
                 }
                 // Provenance stamp (minor r3): every replication-apply site
                 // records into replication_apply_log (schema contract).
