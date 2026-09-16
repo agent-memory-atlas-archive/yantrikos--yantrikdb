@@ -415,12 +415,21 @@ Weights are tuned automatically from usage patterns.
 
 ### Conflict Detection & Resolution
 
-When memories contradict, YantrikDB doesn't guess — it creates a conflict segment:
+YantrikDB detects contradictions between structured or recognized
+single-valued claims, including polarity and temporal conflicts, and
+records them for review. It is not a general natural-language
+contradiction checker: arbitrary sentence pairs and multi-valued
+relations are intentionally not flagged.
 
 ```
 "works at Google" (recorded Jan 15) vs. "works at Meta" (recorded Mar 1)
 → Conflict: identity_fact, priority: high, strategy: ask_user
 ```
+
+Free-text claims beyond the structured/graph layer go through an
+opt-in, English-only copular extractor (off by default; enable with
+`ThinkConfig.extract_attribute_claims`), which is disabled
+automatically for encrypted stores.
 
 Resolution is conversational: the AI asks naturally, not programmatically.
 
@@ -633,7 +642,7 @@ Other MCP/agent-tooling projects from the same author, outside the yantrikdb eng
 
 | Project | What |
 |---------|------|
-| [saga-mcp](https://github.com/spranab/saga-mcp) | SQLite-backed project/task tracker for agents — 31 MCP tools, no external services |
+| [saga-mcp](https://github.com/spranab/saga-mcp) | SQLite-backed project/task tracker for agents — 33 MCP tools, no external services |
 | [brainstorm-mcp](https://github.com/spranab/brainstorm-mcp) | Multi-model debate + synthesis MCP server (GPT, Gemini, DeepSeek, Claude, Ollama) |
 | [truenas-mcp](https://github.com/spranab/truenas-mcp) | Manage TrueNAS SCALE from an agent — 278 actions behind one hierarchical MCP tool |
 | [swarmcode](https://github.com/spranab/swarmcode) | Redis-backed channel so two Claude Code instances on different machines can talk |
