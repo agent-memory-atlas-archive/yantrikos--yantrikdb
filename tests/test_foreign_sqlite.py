@@ -11,6 +11,10 @@ instance (Linux: the ``-shm`` file mapped twice at the same offset in
 
 These tests deliberately do the hazardous thing on a throwaway store,
 with the engine idle between steps, so the corruption window never opens.
+
+Issue #247: the cross-process half (a commit from outside the engine
+queues ``PRAGMA quick_check``) has its own refusal, ``IntegrityCheckFailed``,
+on every platform, and it lifts in-process once a check passes again.
 """
 
 from __future__ import annotations
@@ -185,3 +189,96 @@ def test_a_commit_from_another_process_is_counted_and_checked(store):
     db.record("fourth")
     db.record("fifth")
     assert db.stats()["foreign_commits_detected_since_boot"] == n
+
+
+# Issue #247: a failed integrity check is its own refusal, on every
+# platform (on Windows it is the only one). The damage below is real but
+# harmless and reversible: a row that breaks its table's CHECK constraint,
+# which `PRAGMA quick_check` reports, written and later dropped by another
+# process (never an in-process second library — Rule 9).
+_BREAK = (
+    "CREATE TABLE issue247 (x INTEGER CHECK (x > 0))",
+    "PRAGMA ignore_check_constraints = ON",
+    "INSERT INTO issue247 VALUES (-1)",
+)
+_REPAIR = ("DROP TABLE issue247",)
+
+
+def _sql_in_subprocess(path: str, statements) -> None:
+    code = textwrap.dedent(
+        f"""
+        import sqlite3
+        c = sqlite3.connect({path!r}, timeout=30)
+        for s in {list(statements)!r}:
+            c.execute(s)
+        c.commit()
+        c.close()
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+
+
+def _wait_for(predicate, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_a_failed_integrity_check_has_its_own_error_and_recovers_in_process(store):
+    db, path = store
+    rid = db.record("Alice Moreau works at Fennwick Labs.")
+    db.think()
+    _sql_in_subprocess(path, _BREAK)
+
+    result = db.integrity_check()
+    assert "CHECK constraint failed" in result, result
+    s = db.stats()
+    assert s["integrity_tainted"] is True
+    assert s["foreign_sqlite_tainted"] is False, "a failed check is not a foreign library"
+    assert s["last_integrity_check"] == result
+    assert s["integrity_checks_unconfirmed_since_boot"] == 0, "the writer confirmed it"
+
+    with pytest.raises(yantrikdb.IntegrityCheckFailed, match="CHECK constraint failed") as ei:
+        db.record("this must not be committed")
+    assert not isinstance(ei.value, yantrikdb.ForeignSqliteInstance)
+    assert "POSIX" not in str(ei.value) and path in str(ei.value)
+    with pytest.raises(yantrikdb.IntegrityCheckFailed):
+        db.correct(rid, "nor this")
+    assert db.stats()["foreign_sqlite_refused_since_boot"] >= 2
+    # Reads keep working.
+    assert db.recall(query="Alice Moreau", top_k=3, skip_reinforce=True)
+
+    # Repaired from outside: the next clean check resumes writes, no reopen.
+    _sql_in_subprocess(path, _REPAIR)
+    assert db.integrity_check() == "ok"
+    assert db.stats()["integrity_tainted"] is False
+    assert db.record("Writes resume once the store checks clean.")
+
+
+def test_the_queued_check_refuses_and_the_repair_lifts_it_without_a_call(store):
+    """The path the #247 reporter hit, end to end without calling
+    integrity_check(): an outside commit queues the check, the materializer
+    runs it and refuses; the repair is itself an outside commit, so it
+    queues the check that lifts the refusal — with no call at all."""
+    db, path = store
+    db.record("seed, from this engine")
+    db.think()
+
+    _sql_in_subprocess(path, _BREAK)
+    db.record("the first write after an outside commit queues the check")
+    assert _wait_for(lambda: db.stats()["integrity_tainted"]), db.stats()
+    with pytest.raises(yantrikdb.IntegrityCheckFailed):
+        db.record("refused once the queued check has failed")
+
+    # The first write's materializer op is still pending and can never
+    # commit while refused. Retrying it held the write lock so often that
+    # this outside repair failed with `database is locked` (the reporter's
+    # second symptom); the materializer now parks while writes are refused.
+    _sql_in_subprocess(path, _REPAIR)
+    assert _wait_for(lambda: not db.stats()["integrity_tainted"]), db.stats()
+    assert db.record("writes resume after the queued check passes")
+    assert db.stats()["last_integrity_check"] == "ok"

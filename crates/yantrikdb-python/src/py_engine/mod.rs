@@ -382,16 +382,20 @@ pub(crate) fn map_err(e: yantrikdb_core::YantrikDbError) -> PyErr {
         }
         E::RecallContended { .. } => py_errors::RecallContended::new_err(e.to_string()),
         E::ForeignSqliteInstance { .. } => py_errors::ForeignSqliteInstance::new_err(e.to_string()),
+        E::IntegrityCheckFailed { .. } => py_errors::IntegrityCheckFailed::new_err(e.to_string()),
         // The commit hook's abort surfaces from SQLite as
-        // SQLITE_CONSTRAINT_COMMITHOOK; it means the same thing.
+        // SQLITE_CONSTRAINT_COMMITHOOK. Public writes are pre-checked and
+        // get the typed error for their cause; an abort only reaches here
+        // when the guard tripped between the pre-check and the commit, and
+        // this mapping cannot tell which cause it was — so it says both.
         E::Database(rusqlite::Error::SqliteFailure(ref err, _))
             if err.extended_code == yantrikdb_core::engine::SQLITE_CONSTRAINT_COMMITHOOK =>
         {
             py_errors::ForeignSqliteInstance::new_err(
-                "refusing to write: another SQLite library has this store open in this \
-                 process (issue #225); the commit was aborted. Close that connection, check \
-                 integrity and reopen the engine (its close may have unlinked the \
-                 shared-memory file); use the engine API / a separate process for raw SQL.",
+                "refusing to write: the engine's write guard aborted the commit. Either \
+                 another SQLite library has this store open in this process (issue #225; \
+                 stats()[\"foreign_sqlite_tainted\"]) or the store's integrity check failed \
+                 (issue #247; stats()[\"integrity_tainted\"], recover with integrity_check()).",
             )
         }
         E::PackEmbedderMismatch { .. } => py_errors::PackEmbedderMismatch::new_err(e.to_string()),
@@ -811,8 +815,11 @@ impl PyYantrikDB {
     /// has this store open in this process — the silent-corruption hazard
     /// of issue #225. Every database defaults to `refuse`: writes fail with
     /// `ForeignSqliteInstance` from the first detection until the engine is
-    /// reopened (the foreign library's close may unlink the shm/WAL under it). Detection needs Linux and a
-    /// file-backed store (`stats()["foreign_sqlite_supported"]`).
+    /// reopened (the foreign library's close may unlink the shm/WAL under it). Detection needs Linux or
+    /// macOS and a file-backed store (`stats()["foreign_sqlite_supported"]`).
+    /// The mode also governs the refusal after a failed integrity check
+    /// (`IntegrityCheckFailed`, every platform), which `integrity_check()`
+    /// lifts once the store checks clean.
     fn foreign_sqlite_mode(&self) -> PyResult<String> {
         Ok(self.get_inner()?.foreign_sqlite_mode().as_str().to_string())
     }
@@ -833,9 +840,12 @@ impl PyYantrikDB {
     }
 
     /// `PRAGMA quick_check` on a read connection, recorded in
-    /// `stats()["last_integrity_check"]`. Anything but "ok" makes the engine
-    /// refuse writes until the store is repaired and reopened. Queued
-    /// automatically whenever a commit from outside this engine is seen.
+    /// `stats()["last_integrity_check"]`. A failure is re-run once on the
+    /// writer connection; a confirmed one makes the engine refuse writes
+    /// with `IntegrityCheckFailed` until a later check returns "ok" — so
+    /// after repairing the store, call this to resume writing (no reopen).
+    /// Queued automatically whenever a commit from outside this engine is
+    /// seen.
     fn integrity_check(&self) -> PyResult<String> {
         self.get_inner()?.integrity_check().map_err(map_err)
     }

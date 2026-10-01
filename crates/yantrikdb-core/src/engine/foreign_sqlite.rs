@@ -42,15 +42,24 @@
 //! "someone else committed". Each is counted
 //! (`stats().foreign_commits_detected_since_boot`) and asks for one
 //! `PRAGMA quick_check`, run off the writer by the materializer (or
-//! `integrity_check()` on demand); a failed check taints the store the
+//! `integrity_check()` on demand); a failed check refuses writes the
 //! same way a foreign instance does, because writing onto a corrupt file
 //! only spreads the damage.
+//!
+//! **The two refusals are separate (issue #247).** A failed check is not
+//! a foreign instance: it refuses with its own `IntegrityCheckFailed`,
+//! carrying the check's result, and it is the ONLY cause where the
+//! detector is unsupported (Windows). A bad result is re-run once on the
+//! writer connection before it refuses anything, and it does not latch:
+//! the next check that returns `ok` (on demand, or queued by the next
+//! outside commit — the repair itself) resumes writes in-process. A
+//! detection still latches until reopen, for the reason below.
 //!
 //! **Modes**, durable in `meta.foreign_sqlite_mode`, default `refuse`:
 //! `off` never scans; `warn` scans, logs the transition and counts
 //! (`stats().foreign_sqlite_detected_since_boot`); `refuse` additionally
-//! makes every engine write fail with `ForeignSqliteInstance` while the
-//! condition holds — a pre-check at the public write entry points for a
+//! makes every engine write fail with `ForeignSqliteInstance` (or
+//! `IntegrityCheckFailed`) while the condition holds — a pre-check at the public write entry points for a
 //! typed error, and a commit hook on the writer connection as the hard
 //! guarantee that no engine commit, the materializer's included, lands
 //! in an interleaved WAL. Reads continue.
@@ -144,6 +153,8 @@ pub(crate) struct ForeignSqliteGuard {
     active: AtomicBool,
     /// A scan found one at some point since this engine opened. Latched:
     /// the foreign library's close may have unlinked the shm/WAL under us.
+    /// Only the detector sets it; a failed integrity check lives in
+    /// `last_integrity` (issue #247).
     tainted: AtomicBool,
     detected_since_boot: AtomicU64,
     refused_since_boot: AtomicU64,
@@ -155,7 +166,12 @@ pub(crate) struct ForeignSqliteGuard {
     /// A foreign commit was seen and no integrity check has run since.
     integrity_check_pending: AtomicBool,
     integrity_checks_since_boot: AtomicU64,
-    /// The last `PRAGMA quick_check` result (`ok`, or the first problem).
+    /// Checks whose first result was not `ok` but whose confirming re-run
+    /// was: counted and logged, never refused on.
+    integrity_unconfirmed_since_boot: AtomicU64,
+    /// The last confirmed `PRAGMA quick_check` result (`ok`, or the first
+    /// problem). Anything but `ok` refuses writes until a later check
+    /// returns `ok`.
     last_integrity: parking_lot::Mutex<Option<String>>,
 }
 
@@ -184,6 +200,7 @@ impl ForeignSqliteGuard {
             foreign_commits_detected_since_boot: AtomicU64::new(0),
             integrity_check_pending: AtomicBool::new(false),
             integrity_checks_since_boot: AtomicU64::new(0),
+            integrity_unconfirmed_since_boot: AtomicU64::new(0),
             last_integrity: parking_lot::Mutex::new(None),
         }
     }
@@ -203,6 +220,24 @@ impl ForeignSqliteGuard {
 
     pub(crate) fn last_integrity(&self) -> Option<String> {
         self.last_integrity.lock().clone()
+    }
+
+    pub(crate) fn integrity_unconfirmed_since_boot(&self) -> u64 {
+        self.integrity_unconfirmed_since_boot
+            .load(Ordering::Relaxed)
+    }
+
+    /// The failing result of the last integrity check, if it failed:
+    /// writes are refused (under `refuse`) until a later check is `ok`.
+    pub(crate) fn integrity_failure(&self) -> Option<String> {
+        self.last_integrity.lock().clone().filter(|r| r != "ok")
+    }
+
+    pub(crate) fn integrity_tainted(&self) -> bool {
+        self.last_integrity
+            .lock()
+            .as_deref()
+            .is_some_and(|r| r != "ok")
     }
 
     /// Read the writer connection's `PRAGMA data_version` and compare it
@@ -227,22 +262,41 @@ impl ForeignSqliteGuard {
         false
     }
 
-    /// Record a `PRAGMA quick_check` result. Anything but `ok` taints the
-    /// store: writing onto a corrupt file only spreads the damage.
+    /// Record a confirmed `PRAGMA quick_check` result. Anything but `ok`
+    /// refuses writes — writing onto a corrupt file only spreads the
+    /// damage — until a later result is `ok`, which resumes them.
     pub(crate) fn note_integrity(&self, result: &str) {
         self.integrity_check_pending.store(false, Ordering::Relaxed);
         self.integrity_checks_since_boot
             .fetch_add(1, Ordering::Relaxed);
-        *self.last_integrity.lock() = Some(result.to_string());
+        let prev = self.last_integrity.lock().replace(result.to_string());
         if result != "ok" {
-            self.tainted.store(true, Ordering::Relaxed);
             tracing::error!(
                 store = %self.store,
                 result = %result,
-                "integrity check failed after a commit from outside this engine; \
-                 writes are refused until the store is repaired and the engine reopened"
+                "integrity check failed (confirmed on the writer connection); writes \
+                 are refused until a later integrity_check() returns ok"
+            );
+        } else if let Some(prev) = prev.filter(|r| r != "ok") {
+            tracing::warn!(
+                store = %self.store,
+                previous = %prev,
+                "integrity check passes again; writes resume"
             );
         }
+    }
+
+    /// A first check failed but its confirming re-run passed: count and log
+    /// the discarded result, so a store that flaps shows in stats.
+    pub(crate) fn note_unconfirmed_integrity(&self, first: &str) {
+        self.integrity_unconfirmed_since_boot
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            store = %self.store,
+            first = %first,
+            "integrity check failed on a read connection but passed on the writer; \
+             not refusing writes"
+        );
     }
 
     pub(crate) fn mode(&self) -> ForeignSqliteMode {
@@ -323,24 +377,41 @@ impl ForeignSqliteGuard {
         }
     }
 
+    /// Whether writes are being refused right now, by either cause (no
+    /// rescan: the commit hook and the pre-check keep the verdict fresh).
+    pub(crate) fn refusing(&self) -> bool {
+        decide(self.mode(), self.tainted() || self.integrity_tainted())
+    }
+
     /// Commit-hook body: `true` aborts the commit.
     pub(crate) fn commit_should_abort(&self) -> bool {
         self.scan_cached();
-        let abort = decide(self.mode(), self.tainted());
+        let abort = self.refusing();
         if abort {
             self.refused_since_boot.fetch_add(1, Ordering::Relaxed);
         }
         abort
     }
 
-    /// The typed pre-check at a public write entry point.
+    /// The typed pre-check at a public write entry point. Each cause has
+    /// its own error (issue #247); a detection, the graver, wins.
     pub(crate) fn check_write(&self) -> Result<()> {
         self.scan_cached();
-        if decide(self.mode(), self.tainted()) {
-            self.refused_since_boot.fetch_add(1, Ordering::Relaxed);
-            return Err(YantrikDbError::ForeignSqliteInstance {
+        let err = if self.tainted() {
+            YantrikDbError::ForeignSqliteInstance {
                 path: self.store.clone(),
-            });
+            }
+        } else if let Some(result) = self.integrity_failure() {
+            YantrikDbError::IntegrityCheckFailed {
+                path: self.store.clone(),
+                result,
+            }
+        } else {
+            return Ok(());
+        };
+        if decide(self.mode(), true) {
+            self.refused_since_boot.fetch_add(1, Ordering::Relaxed);
+            return Err(err);
         }
         Ok(())
     }
@@ -587,6 +658,67 @@ mod tests {
         assert!(is_commit_hook_abort(
             &conn.execute("INSERT INTO t VALUES (2)", []).unwrap_err()
         ));
+    }
+
+    /// Issue #247: where the detector is unsupported (here `:memory:`; on
+    /// Windows, every store) a failed check is the only cause, and it must
+    /// say so — never the foreign-library error — and clear on an `ok`.
+    #[test]
+    fn a_failed_check_refuses_with_its_own_error_and_clears_on_ok() {
+        let g = ForeignSqliteGuard::new(":memory:", ForeignSqliteMode::Refuse);
+        assert!(!g.supported());
+        g.note_integrity("*** in database main ***\nPage 7: btreeInitPage() returns error code 11");
+        assert!(!g.tainted(), "a failed check is not a detection");
+        assert!(g.integrity_tainted());
+        match g.check_write() {
+            Err(YantrikDbError::IntegrityCheckFailed { path, result }) => {
+                assert_eq!(path, ":memory:");
+                assert!(result.contains("btreeInitPage"), "{result}");
+            }
+            other => panic!("expected IntegrityCheckFailed, got {other:?}"),
+        }
+        let msg = g.check_write().unwrap_err().to_string();
+        assert!(msg.contains("btreeInitPage"), "{msg}");
+        assert!(!msg.contains("POSIX"), "{msg}");
+        assert!(g.commit_should_abort());
+        assert_eq!(g.refused_since_boot(), 3);
+
+        // warn never refuses on it.
+        g.set_mode(ForeignSqliteMode::Warn);
+        assert!(g.check_write().is_ok() && !g.commit_should_abort());
+        g.set_mode(ForeignSqliteMode::Refuse);
+
+        g.note_integrity("ok");
+        assert!(!g.integrity_tainted());
+        assert!(g.check_write().is_ok());
+        assert!(!g.commit_should_abort());
+        assert_eq!(g.integrity_checks_since_boot(), 2);
+
+        g.note_unconfirmed_integrity("row 3 missing from index x");
+        assert_eq!(g.integrity_unconfirmed_since_boot(), 1);
+        assert!(
+            g.check_write().is_ok(),
+            "an unconfirmed failure never refuses"
+        );
+    }
+
+    /// A detection still latches: an `ok` check does not clear it, and it
+    /// outranks a failed check in the error a caller sees.
+    #[test]
+    fn a_detection_latches_past_an_ok_check_and_wins_the_error() {
+        let g = ForeignSqliteGuard::new(":memory:", ForeignSqliteMode::Refuse);
+        g.tainted.store(true, Ordering::Relaxed);
+        g.note_integrity("CHECK constraint failed in t");
+        assert!(matches!(
+            g.check_write(),
+            Err(YantrikDbError::ForeignSqliteInstance { .. })
+        ));
+        g.note_integrity("ok");
+        assert!(matches!(
+            g.check_write(),
+            Err(YantrikDbError::ForeignSqliteInstance { .. })
+        ));
+        assert!(g.commit_should_abort());
     }
 
     #[test]

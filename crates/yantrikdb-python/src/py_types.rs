@@ -330,6 +330,11 @@ pub fn stats_to_dict(py: Python<'_>, s: &yantrikdb_core::Stats) -> PyResult<PyOb
     dict.set_item("integrity_check_pending", s.integrity_check_pending)?;
     dict.set_item("integrity_checks_since_boot", s.integrity_checks_since_boot)?;
     dict.set_item("last_integrity_check", &s.last_integrity_check)?;
+    dict.set_item("integrity_tainted", s.integrity_tainted)?;
+    dict.set_item(
+        "integrity_checks_unconfirmed_since_boot",
+        s.integrity_checks_unconfirmed_since_boot,
+    )?;
     dict.set_item("provenance_verified_records", s.provenance_verified_records)?;
     dict.set_item(
         "unverified_user_source_records",

@@ -269,9 +269,26 @@ engine write goes through that one connection, so a change is exactly
 backup tool — legitimate, but the only way the store changes under the
 engine). Each is counted (`stats().foreign_commits_detected_since_boot`)
 and queues one `PRAGMA quick_check`, run off the writer by the
-materializer or by `integrity_check()` on demand; a failed check taints
-the store the same way, because writing onto a corrupt file only spreads
-the damage.
+materializer or by `integrity_check()` on demand; a failed check refuses
+writes too, because writing onto a corrupt file only spreads the damage.
+
+A failed check is its own refusal, not a foreign instance (issue #247):
+writes fail with `IntegrityCheckFailed`, whose message carries
+the check's result, and `stats().integrity_tainted` is set while
+`foreign_sqlite_tainted` stays false. It is the only refusal possible on
+Windows. A bad result is re-run once on the writer connection before it
+refuses anything (a discarded one counts in
+`integrity_checks_unconfirmed_since_boot`), and it does not latch: the
+next check that returns `ok` resumes writes in the same process. After
+repairing or restoring the store from another process, call
+`integrity_check()`; a repair made by another process is itself an
+outside commit, so the materializer queues that check anyway: while
+writes are refused (either cause) it parks instead of draining, and
+watches `data_version`. It used to retry its pending ops every tick,
+each one taking the write lock and being aborted at commit, which kept
+other processes out with `database is locked`, the repair included.
+Do not reach for `set_foreign_sqlite_mode("warn")` to get writes back:
+it persists to `meta` and disarms both refusals for every future open.
 
 ---
 

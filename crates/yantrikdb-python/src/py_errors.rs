@@ -83,6 +83,19 @@ create_exception!(
 
 create_exception!(
     yantrikdb,
+    IntegrityCheckFailed,
+    PyRuntimeError,
+    "The store's integrity check (`PRAGMA quick_check`) failed, on a read \
+     connection and again on the writer, and the engine refused to write: \
+     writing onto a damaged file spreads the damage (issue #247). Not a \
+     foreign SQLite library. The message carries the check's result. Inspect \
+     the store from another process and repair or restore it; writes resume \
+     in-process as soon as `integrity_check()` returns \"ok\" — no reopen \
+     needed. `stats()[\"integrity_tainted\"]` says whether it holds."
+);
+
+create_exception!(
+    yantrikdb,
     RecallContended,
     PyRuntimeError,
     "A recall lost a bounded read-contention race (writer-priority lock \

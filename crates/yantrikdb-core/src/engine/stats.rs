@@ -311,6 +311,10 @@ impl YantrikDB {
             integrity_check_pending: self.foreign_sqlite.integrity_check_pending(),
             integrity_checks_since_boot: self.foreign_sqlite.integrity_checks_since_boot(),
             last_integrity_check: self.foreign_sqlite.last_integrity().unwrap_or_default(),
+            integrity_tainted: self.foreign_sqlite.integrity_tainted(),
+            integrity_checks_unconfirmed_since_boot: self
+                .foreign_sqlite
+                .integrity_unconfirmed_since_boot(),
             provenance_verified_records,
             unverified_user_source_records,
             provenance_source_counts,
