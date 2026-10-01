@@ -46,6 +46,10 @@ fn _yantrikdb_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<py_errors::ForeignSqliteInstance>(),
     )?;
     m.add(
+        "IntegrityCheckFailed",
+        m.py().get_type::<py_errors::IntegrityCheckFailed>(),
+    )?;
+    m.add(
         "PackEmbedderMismatch",
         m.py().get_type::<py_errors::PackEmbedderMismatch>(),
     )?;

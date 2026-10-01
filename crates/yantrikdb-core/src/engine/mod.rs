@@ -2133,7 +2133,9 @@ impl YantrikDB {
 
     /// Durably set the guard mode. `warn` keeps writing and counts
     /// detections; `off` never scans. Both are opt-outs from a corruption
-    /// guard — say why in the operator log.
+    /// guard — say why in the operator log. The mode also governs the
+    /// refusal after a failed integrity check (`IntegrityCheckFailed`);
+    /// recover from that with `integrity_check()`, not a mode change.
     pub fn set_foreign_sqlite_mode(&self, mode: foreign_sqlite::ForeignSqliteMode) -> Result<()> {
         let conn = self.conn();
         conn.execute(
@@ -2163,21 +2165,48 @@ impl YantrikDB {
     /// notice a commit that did not come through this engine, queue an
     /// integrity check, and refuse if a check already failed.
     pub(crate) fn foreign_commit_precheck(&self) -> Result<()> {
-        {
-            let conn = self.conn();
-            self.foreign_sqlite.note_data_version(&conn);
-        }
+        self.note_outside_commits();
         self.foreign_sqlite.check_write()
     }
 
-    /// `PRAGMA quick_check` on a read connection, recorded in the guard:
-    /// anything but `ok` taints the store (writes refused until it is
-    /// repaired and the engine reopened). Runs on demand here and from the
-    /// materializer whenever a commit from outside this engine was seen.
+    /// Notice a commit that did not come through this engine and queue an
+    /// integrity check for it. Takes the writer connection.
+    pub(crate) fn note_outside_commits(&self) {
+        let conn = self.conn();
+        self.foreign_sqlite.note_data_version(&conn);
+    }
+
+    /// Whether the guard is refusing writes right now (either cause).
+    pub(crate) fn foreign_sqlite_refusing(&self) -> bool {
+        self.foreign_sqlite.refusing()
+    }
+
+    /// `PRAGMA quick_check` on a read connection, recorded in the guard.
+    /// A result other than `ok` is re-run once on the writer connection
+    /// (the view every engine write goes through) before it counts: only a
+    /// confirmed failure refuses writes, with `IntegrityCheckFailed`
+    /// (issue #247). Not latched — the next check that returns `ok`
+    /// resumes writes. Runs on demand here and from the materializer
+    /// whenever a commit from outside this engine was seen.
     pub fn integrity_check(&self) -> Result<String> {
-        let result: String = {
+        let quick_check = |conn: &rusqlite::Connection| -> Result<String> {
+            Ok(conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?)
+        };
+        let first = {
             let conn = self.read_conn();
-            conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?
+            quick_check(&conn)?
+        };
+        let result = if first == "ok" {
+            first
+        } else {
+            let again = {
+                let conn = self.conn();
+                quick_check(&conn)?
+            };
+            if again == "ok" {
+                self.foreign_sqlite.note_unconfirmed_integrity(&first);
+            }
+            again
         };
         self.foreign_sqlite.note_integrity(&result);
         Ok(result)

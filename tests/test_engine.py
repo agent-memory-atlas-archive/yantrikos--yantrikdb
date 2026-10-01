@@ -308,6 +308,8 @@ class TestStats:
             "foreign_sqlite_tainted",
             "foreign_commits_detected_since_boot", "integrity_check_pending",
             "integrity_checks_since_boot", "last_integrity_check",
+            # Issue #247: a failed integrity check is its own refusal.
+            "integrity_tainted", "integrity_checks_unconfirmed_since_boot",
             "foreign_sqlite_detected_since_boot", "foreign_sqlite_refused_since_boot",
             # Provenance-origin census: explicitly verified records and
             # legacy/user-source rows without an explicit verification marker.

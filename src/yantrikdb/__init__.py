@@ -15,6 +15,7 @@ from yantrikdb._yantrikdb_rust import (
     ProvenanceInconsistent,
     RecallContended,
     ForeignSqliteInstance,
+    IntegrityCheckFailed,
     SourceTurnMaintenanceRequiredError,
     TenantManager,
     YantrikDB,
@@ -100,5 +101,6 @@ __all__ = [
     "ProvenanceInconsistent",
     "RecallContended",
     "ForeignSqliteInstance",
+    "IntegrityCheckFailed",
     "SourceTurnMaintenanceRequiredError",
 ]

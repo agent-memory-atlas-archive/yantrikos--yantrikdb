@@ -107,6 +107,20 @@ fn worker_loop(weak: Weak<YantrikDB>, shutdown: Arc<AtomicBool>, worker_id: usiz
         // check; run it here, off the writer, before draining.
         db.run_pending_integrity_check();
 
+        // Issue #247: while writes are refused, every drain takes the write
+        // lock, does its work and is aborted at commit — every worker,
+        // every tick — which starves any other process that needs the lock,
+        // the repair included (measured: `database is locked` from outside
+        // for as long as an op was pending). Park instead, but keep reading
+        // `data_version` so an outside repair queues the check that lifts
+        // the refusal without waiting for a caller's write.
+        if db.foreign_sqlite_refusing() {
+            db.note_outside_commits();
+            drop(db);
+            std::thread::sleep(IDLE_POLL_INTERVAL);
+            continue;
+        }
+
         match db.apply_pending_ops_once(DRAIN_BATCH_SIZE) {
             Ok(0) => {
                 // No work — release the strong ref before sleeping so the

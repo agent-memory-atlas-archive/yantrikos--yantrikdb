@@ -459,9 +459,11 @@ pub enum YantrikDbError {
     /// process (Python's stdlib `sqlite3`, a system `libsqlite3`). POSIX
     /// advisory locks are per process, so its unlock releases the engine's
     /// and two writers would interleave WAL commits — silent page aliasing.
-    /// The engine refuses to write while the condition holds; writes resume
-    /// once the foreign connection closes. Use the engine API or a separate
-    /// process for raw SQL. See CONCURRENCY.md Rule 9.
+    /// The engine refuses to write from the first detection until it is
+    /// reopened (the foreign close may unlink the shm/WAL under it). Use the
+    /// engine API or a separate process for raw SQL. See CONCURRENCY.md
+    /// Rule 9. Never raised for a failed integrity check — that is
+    /// `IntegrityCheckFailed` (issue #247).
     #[error(
         "refusing to write: another SQLite library has {path} open in this process \
          (issue #225 — POSIX locks are per process, so its unlock releases the engine's \
@@ -470,6 +472,22 @@ pub enum YantrikDbError {
          file); use the engine API / a separate process for raw SQL."
     )]
     ForeignSqliteInstance { path: String },
+
+    /// **Issue #247.** `PRAGMA quick_check` on this store failed, on a read
+    /// connection and again on the writer, after a commit from outside
+    /// this engine (or on an explicit `integrity_check()`). Writes are
+    /// refused because writing onto a damaged file spreads the damage.
+    /// Not a foreign SQLite library — the only cause on Windows, where the
+    /// detector is unsupported. Not latched: writes resume as soon as an
+    /// `integrity_check()` returns `ok`.
+    #[error(
+        "refusing to write: the integrity check of {path} failed (PRAGMA quick_check: \
+         {result}). Writing onto a damaged file would spread the damage. Inspect the \
+         store from another process (sqlite3 \"{path}\" \"PRAGMA integrity_check\") and \
+         repair or restore it; writes resume as soon as integrity_check() returns \"ok\" \
+         (stats(): integrity_tainted, last_integrity_check)."
+    )]
+    IntegrityCheckFailed { path: String, result: String },
 
     /// **v0.10 Item 4a.6c — durable idempotency (T07).** The caller reused an
     /// idempotency key whose committed claim does not match this write —

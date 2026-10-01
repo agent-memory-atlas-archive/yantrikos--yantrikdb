@@ -683,6 +683,7 @@ pub struct Stats {
     /// A foreign instance was seen at some point since this engine opened.
     /// Latched: its close may have unlinked the shm/WAL under the engine,
     /// so writes stay refused (under `refuse`) until the engine is reopened.
+    /// Detector only — a failed integrity check is `integrity_tainted`.
     #[serde(default)]
     pub foreign_sqlite_tainted: bool,
     /// Scans since boot that found a foreign instance.
@@ -704,6 +705,15 @@ pub struct Stats {
     /// The last `PRAGMA quick_check` result, empty until one has run.
     #[serde(default)]
     pub last_integrity_check: String,
+    /// Issue #247: the last integrity check failed (confirmed), so writes
+    /// are refused (under `refuse`) with `IntegrityCheckFailed` until a
+    /// later check returns `ok`.
+    #[serde(default)]
+    pub integrity_tainted: bool,
+    /// Checks that failed on a read connection but passed the confirming
+    /// re-run on the writer; never refused on.
+    #[serde(default)]
+    pub integrity_checks_unconfirmed_since_boot: u64,
     /// Non-tombstoned records carrying an explicit, caller-supplied
     /// `metadata.provenance_verified = true` marker. This is an audit signal,
     /// not an engine assertion: the engine cannot reconstruct authorship.
