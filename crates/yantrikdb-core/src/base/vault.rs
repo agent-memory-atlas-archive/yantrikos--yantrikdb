@@ -39,11 +39,46 @@ use rusqlite::Connection;
 use super::encryption::{self, EncryptionProvider};
 use super::error::{Result, YantrikDbError};
 
-/// The unwrapped data key for this process, once a passphrase has opened the vault.
+/// The unwrapped data keys this process holds, one per vault a passphrase has opened.
 ///
 /// In memory, never on disk. A caller that has not unlocked gets an error rather than data,
 /// which is the point of wrapping the key in the first place.
-static UNLOCKED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+///
+/// Keyed by the vault's `kdf_salt` (16 random bytes, written with the wrapped key), so a key is
+/// only ever used for the vault it was unwrapped from. It used to be one slot for the whole
+/// process, and every vault in the process used whatever key sat in it: with one vault unlocked,
+/// a second vault could not be read, and protecting the second wrapped the FIRST vault's key,
+/// deleted its own and left its entries undecryptable for good.
+static UNLOCKED: Mutex<Vec<(String, [u8; 32])>> = Mutex::new(Vec::new());
+
+/// The key this process holds for this vault, if it has been unlocked.
+fn held_key(conn: &Connection) -> Option<[u8; 32]> {
+    let salt = read_row(conn, "kdf_salt")?;
+    let guard = UNLOCKED.lock().ok()?;
+    guard.iter().find(|(s, _)| *s == salt).map(|(_, dek)| *dek)
+}
+
+/// Hold `dek` as the key of the vault whose salt is `salt`.
+fn hold_key(salt: String, dek: [u8; 32]) {
+    if let Ok(mut guard) = UNLOCKED.lock() {
+        forget_in(&mut guard, &salt);
+        guard.push((salt, dek));
+    }
+}
+
+/// Forget the key held for one salt, overwriting it first (see [`lock`]).
+fn forget_key(salt: &str) {
+    if let Ok(mut guard) = UNLOCKED.lock() {
+        forget_in(&mut guard, salt);
+    }
+}
+
+fn forget_in(held: &mut Vec<(String, [u8; 32])>, salt: &str) {
+    for (_, dek) in held.iter_mut().filter(|(s, _)| s == salt) {
+        dek.iter_mut().for_each(|b| *b = 0);
+    }
+    held.retain(|(s, _)| s != salt);
+}
 
 /// How hard it is to turn a passphrase into a key.
 ///
@@ -96,9 +131,10 @@ pub fn is_protected(conn: &Connection) -> bool {
     read_row(conn, "dek_wrapped").is_some()
 }
 
-/// Whether this process currently holds the unwrapped key.
+/// Whether this process currently holds an unwrapped key, for any vault.
+/// [`vault_encryption`] still refuses a vault whose own key it does not hold.
 pub fn is_unlocked() -> bool {
-    UNLOCKED.lock().map(|g| g.is_some()).unwrap_or(false)
+    UNLOCKED.lock().map(|g| !g.is_empty()).unwrap_or(false)
 }
 
 /// Open the vault with a passphrase, and keep the key for this process.
@@ -125,21 +161,19 @@ pub fn unlock(conn: &Connection, passphrase: &str) -> Result<EncryptionProvider>
     let dek = encryption::unwrap_dek(&kek, &wrapped)
         .map_err(|_| YantrikDbError::Encryption("wrong passphrase".into()))?;
 
-    if let Ok(mut guard) = UNLOCKED.lock() {
-        *guard = Some(dek);
-    }
+    hold_key(salt_b64, dek);
     Ok(EncryptionProvider::from_dek(&dek))
 }
 
-/// Forget the key. The vault cannot be read again without the passphrase.
+/// Forget every key this process holds. No vault can be read again without its passphrase.
 pub fn lock() {
     if let Ok(mut guard) = UNLOCKED.lock() {
-        if let Some(dek) = guard.as_mut() {
-            // Overwritten rather than dropped: a freed buffer keeps its contents until something
-            // else claims the page, and a key is worth the four lines.
+        // Overwritten rather than dropped: a freed buffer keeps its contents until something
+        // else claims the page, and a key is worth the few lines.
+        for (_, dek) in guard.iter_mut() {
             dek.iter_mut().for_each(|b| *b = 0);
         }
-        *guard = None;
+        guard.clear();
     }
 }
 
@@ -155,8 +189,15 @@ pub fn set_passphrase(conn: &Connection, passphrase: &str) -> Result<()> {
     }
 
     // The key to keep: whatever is currently in use, so nothing already stored becomes unreadable.
+    // A protected vault that is locked has no key to keep; generating a fresh one here would
+    // silently orphan every entry, so it is refused instead.
+    let old_salt = read_row(conn, "kdf_salt");
     let dek = if let Some(existing) = current_dek(conn) {
         existing
+    } else if is_protected(conn) {
+        return Err(YantrikDbError::Encryption(
+            "the vault is locked; unlock it before changing its passphrase".into(),
+        ));
     } else {
         encryption::generate_key()
     };
@@ -165,8 +206,9 @@ pub fn set_passphrase(conn: &Connection, passphrase: &str) -> Result<()> {
     rand::thread_rng().fill(&mut salt);
     let kek = derive_kek(passphrase, &salt)?;
     let wrapped = encryption::wrap_dek(&kek, &dek)?;
+    let salt_b64 = B64.encode(salt);
 
-    write_row(conn, "kdf_salt", &B64.encode(salt))?;
+    write_row(conn, "kdf_salt", &salt_b64)?;
     write_row(conn, "dek_wrapped", &B64.encode(&wrapped))?;
     write_row(conn, "kdf", "argon2id")?;
 
@@ -176,18 +218,18 @@ pub fn set_passphrase(conn: &Connection, passphrase: &str) -> Result<()> {
     // table about what is guarding this vault.
     conn.execute("DELETE FROM vault_security WHERE key = 'pin_hash'", [])?;
 
-    if let Ok(mut guard) = UNLOCKED.lock() {
-        *guard = Some(dek);
+    if let Some(old) = old_salt {
+        forget_key(&old);
     }
+    hold_key(salt_b64, dek);
     Ok(())
 }
 
-/// The data key currently in force, from memory or from a legacy plaintext row.
+/// This vault's data key: the one held for it in memory, or its legacy plaintext row.
+/// Never another vault's.
 fn current_dek(conn: &Connection) -> Option<[u8; 32]> {
-    if let Ok(guard) = UNLOCKED.lock() {
-        if let Some(dek) = *guard {
-            return Some(dek);
-        }
+    if let Some(dek) = held_key(conn) {
+        return Some(dek);
     }
     let b64 = read_row(conn, "vault_dek")?;
     let bytes = B64.decode(&b64).ok()?;
@@ -205,11 +247,9 @@ fn current_dek(conn: &Connection) -> Option<[u8; 32]> {
 /// This is independent of the DB-level encryption — works even when the DB is opened
 /// without a master key.
 pub fn vault_encryption(conn: &Connection) -> Result<EncryptionProvider> {
-    // Unlocked in this process: use the key we already hold.
-    if let Ok(guard) = UNLOCKED.lock() {
-        if let Some(dek) = *guard {
-            return Ok(EncryptionProvider::from_dek(&dek));
-        }
+    // Unlocked in this process: use the key we already hold for THIS vault.
+    if let Some(dek) = held_key(conn) {
+        return Ok(EncryptionProvider::from_dek(&dek));
     }
 
     // Protected but not unlocked. Refused, and told why — this is the case the wrapping exists
@@ -535,6 +575,9 @@ pub fn remove_pin(conn: &Connection) -> Result<()> {
     let dek = current_dek(conn).ok_or_else(|| {
         YantrikDbError::Encryption("unlock the vault before removing its protection".into())
     })?;
+    if let Some(salt) = read_row(conn, "kdf_salt") {
+        forget_key(&salt);
+    }
 
     write_row(conn, "vault_dek", &B64.encode(dek))?;
     conn.execute("DELETE FROM vault_security WHERE key = 'dek_wrapped'", [])?;
@@ -596,6 +639,16 @@ mod tests {
         (conn, enc)
     }
 
+    /// The unwrapped keys live in one process-wide table and `lock()` clears all of it, so tests
+    /// that touch it run one at a time; in parallel, one test's `lock()` emptied another's vault
+    /// between its `set_passphrase` and its read (seen on Windows CI).
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ── What the wrapping is for ────────────────────────────────────
     //
     // These tests are written as attacks, because that is the only way to know whether a
@@ -606,6 +659,7 @@ mod tests {
     /// involved at any point.
     #[test]
     fn deleting_the_pin_row_no_longer_opens_the_vault() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -639,6 +693,7 @@ mod tests {
     /// The file used to be enough on its own. It must not be.
     #[test]
     fn the_database_file_alone_does_not_contain_the_key() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -671,6 +726,7 @@ mod tests {
     /// the one that would catch a future change putting the key back by another name.
     #[test]
     fn no_value_left_in_the_file_can_decrypt_an_entry() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -721,6 +777,7 @@ mod tests {
 
     #[test]
     fn a_wrong_passphrase_fails_rather_than_producing_nonsense() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -739,6 +796,7 @@ mod tests {
     /// Migration must not cost anyone their credentials, or nobody will run it.
     #[test]
     fn protecting_an_existing_vault_keeps_what_is_in_it() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -763,6 +821,7 @@ mod tests {
 
     #[test]
     fn locking_forgets_the_key() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -783,6 +842,7 @@ mod tests {
     /// their own credentials — but it must not claim to be protected.
     #[test]
     fn a_legacy_vault_still_opens_and_says_it_is_unprotected() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -814,6 +874,7 @@ mod tests {
 
     #[test]
     fn an_empty_passphrase_is_refused() {
+        let _serial = serial();
         let conn = Connection::open_in_memory().unwrap();
         init_tables(&conn);
         lock();
@@ -954,6 +1015,7 @@ mod tests {
 
     #[test]
     fn test_pin_set_verify() {
+        let _serial = serial();
         let (conn, _) = setup();
         assert!(!has_pin(&conn));
 
@@ -965,6 +1027,7 @@ mod tests {
 
     #[test]
     fn test_pin_remove() {
+        let _serial = serial();
         let (conn, _) = setup();
         set_pin(&conn, "9999").unwrap();
         assert!(has_pin(&conn));
@@ -974,11 +1037,117 @@ mod tests {
 
     #[test]
     fn test_pin_change() {
+        let _serial = serial();
         let (conn, _) = setup();
         set_pin(&conn, "old_pin").unwrap();
         assert!(verify_pin(&conn, "old_pin"));
         set_pin(&conn, "new_pin").unwrap();
         assert!(!verify_pin(&conn, "old_pin"));
         assert!(verify_pin(&conn, "new_pin"));
+    }
+
+    // ── More than one vault in a process ────────────────────────────
+    //
+    // The unwrapped key used to be one slot for the whole process, and every vault used whatever
+    // sat in it. Each of these lost or refused data that way.
+
+    /// With one vault unlocked, a second vault is read with its own key, and protecting it wraps
+    /// its own key, so its entries survive under its own passphrase.
+    #[test]
+    fn a_second_vault_in_the_process_keeps_its_own_key() {
+        let _serial = serial();
+        lock();
+        let b = Connection::open_in_memory().unwrap();
+        init_tables(&b);
+        let enc_b = vault_encryption(&b).unwrap();
+        store(&b, &enc_b, "b.example", "bob", "b-secret", None, None, None).unwrap();
+
+        let a = Connection::open_in_memory().unwrap();
+        init_tables(&a);
+        set_passphrase(&a, "passphrase for A").unwrap();
+        let enc_a = vault_encryption(&a).unwrap();
+        store(
+            &a,
+            &enc_a,
+            "a.example",
+            "alice",
+            "a-secret",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Used to fail with "decrypt failed": B was read with A's key.
+        let enc_b = vault_encryption(&b).unwrap();
+        assert_eq!(
+            get(&b, &enc_b, "b.example").unwrap()[0].password,
+            "b-secret"
+        );
+
+        // Used to wrap A's key into B and delete B's own: B's entries were gone for good.
+        set_passphrase(&b, "passphrase for B").unwrap();
+        lock();
+        let enc_b = unlock(&b, "passphrase for B").unwrap();
+        assert_eq!(
+            get(&b, &enc_b, "b.example").unwrap()[0].password,
+            "b-secret"
+        );
+        assert!(vault_encryption(&a).is_err(), "unlocking B must not open A");
+        let enc_a = unlock(&a, "passphrase for A").unwrap();
+        assert_eq!(
+            get(&a, &enc_a, "a.example").unwrap()[0].password,
+            "a-secret"
+        );
+        lock();
+    }
+
+    /// A locked vault has no key to keep, so a new passphrase would mean a new key and every
+    /// entry orphaned. Refused; the entries stay readable under the old passphrase.
+    #[test]
+    fn changing_the_passphrase_of_a_locked_vault_is_refused() {
+        let _serial = serial();
+        lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_tables(&conn);
+        set_passphrase(&conn, "the original").unwrap();
+        let enc = vault_encryption(&conn).unwrap();
+        store(&conn, &enc, "kept.example", "u", "kept", None, None, None).unwrap();
+        lock();
+
+        assert!(set_passphrase(&conn, "a new one").is_err());
+        let enc = unlock(&conn, "the original").unwrap();
+        assert_eq!(
+            get(&conn, &enc, "kept.example").unwrap()[0].password,
+            "kept"
+        );
+        lock();
+    }
+
+    /// Removing protection writes the vault's key into the file; it must be this vault's key, and
+    /// a locked vault has none to write.
+    #[test]
+    fn removing_protection_never_writes_another_vaults_key() {
+        let _serial = serial();
+        lock();
+        let b = Connection::open_in_memory().unwrap();
+        init_tables(&b);
+        set_passphrase(&b, "passphrase for B").unwrap();
+        let enc_b = vault_encryption(&b).unwrap();
+        store(&b, &enc_b, "b.example", "bob", "b-secret", None, None, None).unwrap();
+        lock();
+
+        let a = Connection::open_in_memory().unwrap();
+        init_tables(&a);
+        set_passphrase(&a, "passphrase for A").unwrap();
+
+        assert!(remove_pin(&b).is_err(), "B is locked; A's key is not B's");
+        assert!(is_protected(&b));
+        let enc_b = unlock(&b, "passphrase for B").unwrap();
+        assert_eq!(
+            get(&b, &enc_b, "b.example").unwrap()[0].password,
+            "b-secret"
+        );
+        lock();
     }
 }
