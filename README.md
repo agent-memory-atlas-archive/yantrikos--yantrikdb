@@ -644,7 +644,7 @@ Other MCP/agent-tooling projects from the same author, outside the yantrikdb eng
 
 | Project | What |
 |---------|------|
-| [saga-mcp](https://github.com/spranab/saga-mcp) | SQLite-backed project/task tracker for agents — 33 MCP tools, no external services |
+| [saga-mcp](https://github.com/spranab/saga-mcp) | SQLite-backed project/task tracker for agents — 41 MCP tools, no external services |
 | [brainstorm-mcp](https://github.com/spranab/brainstorm-mcp) | Multi-model debate + synthesis MCP server (GPT, Gemini, DeepSeek, Claude, Ollama) |
 | [truenas-mcp](https://github.com/spranab/truenas-mcp) | Manage TrueNAS SCALE from an agent — 278 actions behind one hierarchical MCP tool |
 | [swarmcode](https://github.com/spranab/swarmcode) | Redis-backed channel so two Claude Code instances on different machines can talk |
@@ -653,6 +653,7 @@ Other MCP/agent-tooling projects from the same author, outside the yantrikdb eng
 | [icantmarket-mcp](https://github.com/spranab/icantmarket-mcp) | Browse, ask, and review on icantmarket from inside an MCP client |
 | [tier](https://github.com/yantrikos/tier) | Adapts tool presentation to model size — +10pp accuracy, 97% fewer tool tokens on sub-4B models |
 | [chronicler](https://github.com/yantrikos/chronicler) | Self-hosted AI roleplay client with memory that survives long campaigns |
+| [contextcache](https://github.com/spranab/contextcache) | Caches tool-schema KV states across requests — TTFT stays ~200ms with 50 tools instead of 5.6s uncached |
 
 ## Roadmap
 
