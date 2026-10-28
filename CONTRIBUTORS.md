@@ -12,8 +12,18 @@ YantrikDB is primarily developed by [Pranab Sarkar](https://github.com/spranab) 
 
 - **Governance suggestion (2026-05-13).** Recommended branch protection + PR-required workflow on main, citing workflow pass/fail history, force-push prevention, audit trail, and supply-chain security framing. Adopted same session: branch protection now active on all yantrikos repos, `gh pr merge --auto --squash` is the standard workflow going forward.
 
+### Hugo Gundlach ([@Huy3ko](https://github.com/Huy3ko))
+
+- **[PR #256](https://github.com/yantrikos/yantrikdb/pull/256): `think()` triggers stay inside one namespace** (2026-10-27, released in v0.23.4). Found and fixed a cross-namespace disclosure. `check_redundancy` paired the most recent active memories across the whole store, so a store holding several namespaces could persist a `redundancy` or `potential_conflict` trigger in `trigger_log` carrying verbatim text from two of them. The fix scans per namespace and adds a final check before persistence that drops any trigger whose source records span namespaces. The PR includes a control test proving the same-namespace check still fires, and it names the out-of-scope gaps it measured. The commit landed as [27b11d7](https://github.com/yantrikos/yantrikdb/commit/27b11d7) under an author email not linked to a GitHub account, so GitHub doesn't credit it; this entry records the attribution.
+
+### [@wolf-crazy](https://github.com/wolf-crazy)
+
+- **[PR #254](https://github.com/yantrikos/yantrikdb/pull/254): a compression gist is never a cluster seed** (2026-10-23, released in v0.23.3). Scoped the fix for [#253](https://github.com/yantrikos/yantrikdb/issues/253) to seed selection only: a gist stays eligible as a member but can no longer seed a cluster. Applied it at both the consolidation and topic-mining call sites, with tests for each side of that rule.
+- **[PR #252](https://github.com/yantrikos/yantrikdb/pull/252): bundled embedder cache location** (released in v0.23.3). The bundled model is cached under the platform cache dir, falling back to the temp dir when that can't be written.
+
 ### Reporters
 
+- **[antonius888](https://github.com/antonius888)**: filed [#253](https://github.com/yantrikos/yantrikdb/issues/253) (consolidation merging unrelated records on a Hermes store). The live repro, cluster-size histogram, trigger dump and SQL for inspecting `consolidated_into` pointed to both the gist seed problem fixed in v0.23.3 and the default embedder's behaviour on non-English text.
 - **[alienos](https://github.com/alienos)** — filed [yantrikdb-hermes-plugin#1](https://github.com/yantrikos/yantrikdb-hermes-plugin/issues/1) (multilingual embedding support → engine v0.7.9 `potion-multilingual-128M` bundling) and [yantrikdb-hermes-plugin#4](https://github.com/yantrikos/yantrikdb-hermes-plugin/issues/4) (`has_embedder()` false-negative bug → engine v0.7.10 fix). Clear repros + evidence sections made diagnosis straightforward in both cases.
 
 ## How attribution works going forward
