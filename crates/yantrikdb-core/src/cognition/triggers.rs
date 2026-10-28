@@ -260,7 +260,41 @@ pub fn check_temporal_drift(db: &YantrikDB) -> Result<Vec<Trigger>> {
 }
 
 /// Trigger for near-duplicate active memories (cosine similarity > 0.85).
-pub fn check_redundancy(db: &YantrikDB, _sim_threshold: f64) -> Result<Vec<Trigger>> {
+///
+/// **Namespace-pure by construction.** The candidate scan runs once per
+/// namespace. Two people recorded into one store must never be paired into
+/// a single trigger: the payload carries both texts (`context.text_a` /
+/// `context.text_b`), so a cross-namespace pair is a disclosure, not just a
+/// bad suggestion. This is the same boundary `consolidate_cluster` enforces
+/// with a hard error when a cluster spans namespaces.
+pub fn check_redundancy(db: &YantrikDB, sim_threshold: f64) -> Result<Vec<Trigger>> {
+    let namespaces: Vec<String> = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT namespace FROM memories \
+             WHERE consolidation_status = 'active' \
+             AND embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut triggers = Vec::new();
+    for namespace in namespaces {
+        triggers.extend(check_redundancy_in_namespace(
+            db,
+            &namespace,
+            sim_threshold,
+        )?);
+    }
+    Ok(triggers)
+}
+
+fn check_redundancy_in_namespace(
+    db: &YantrikDB,
+    namespace: &str,
+    _sim_threshold: f64,
+) -> Result<Vec<Trigger>> {
     // Phase 1: Collect memory data while holding the conn lock.
     let rows: Vec<(String, String, Vec<u8>)> = {
         let conn = db.conn();
@@ -269,12 +303,13 @@ pub fn check_redundancy(db: &YantrikDB, _sim_threshold: f64) -> Result<Vec<Trigg
              FROM memories \
              WHERE consolidation_status = 'active' \
              AND embedding IS NOT NULL \
+             AND namespace = ?1 \
              ORDER BY created_at DESC \
              LIMIT 30",
         )?;
 
         let raw_rows: Vec<(String, String, Vec<u8>)> = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params![namespace], |row| {
                 Ok((
                     row.get::<_, String>("rid")?,
                     row.get::<_, String>("text")?,
@@ -946,12 +981,83 @@ impl YantrikDB {
     }
 }
 
+/// Drop any trigger whose source rids span more than one namespace.
+///
+/// The individual checks scope themselves, but this is the last gate before
+/// an artifact becomes durable, and durability is what makes a leak
+/// irreversible: a pairing trigger's `context` carries verbatim text from
+/// both sides (`text_a` / `text_b`), so once such a row is in `trigger_log`
+/// the disclosure has already happened — a later display filter can only
+/// hide it.
+///
+/// Fail-closed applies to the *proven* case: a trigger is dropped when its
+/// rids resolve to different namespaces. A rid that no longer resolves is
+/// left alone (the memory is gone, the trigger names no live text) and
+/// logged at debug; guessing ownership there would drop legitimate
+/// single-rid triggers for forgotten memories.
+pub fn drop_cross_namespace_triggers(db: &YantrikDB, triggers: Vec<Trigger>) -> Vec<Trigger> {
+    if triggers.is_empty() {
+        return triggers;
+    }
+
+    let mut namespace_of: HashMap<String, Option<String>> = HashMap::new();
+    {
+        let conn = db.conn();
+        let mut stmt = match conn.prepare_cached("SELECT namespace FROM memories WHERE rid = ?1") {
+            Ok(s) => s,
+            // Cannot resolve ownership at all: do not invent a boundary.
+            Err(_) => return triggers,
+        };
+        for t in &triggers {
+            for rid in &t.source_rids {
+                if namespace_of.contains_key(rid) {
+                    continue;
+                }
+                let ns = stmt
+                    .query_row(rusqlite::params![rid], |r| r.get::<_, String>(0))
+                    .ok();
+                namespace_of.insert(rid.clone(), ns);
+            }
+        }
+    }
+
+    let mut kept = Vec::with_capacity(triggers.len());
+    for trigger in triggers {
+        let mut span: Option<&str> = None;
+        let mut crosses = false;
+        for rid in &trigger.source_rids {
+            let Some(Some(namespace)) = namespace_of.get(rid) else {
+                continue;
+            };
+            match span {
+                None => span = Some(namespace.as_str()),
+                Some(seen) if seen != namespace.as_str() => {
+                    crosses = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if crosses {
+            tracing::warn!(
+                trigger_type = %trigger.trigger_type,
+                rids = ?trigger.source_rids,
+                "dropping trigger: source memories span namespaces"
+            );
+        } else {
+            kept.push(trigger);
+        }
+    }
+    kept
+}
+
 /// Filter triggers by cooldown and persist. Returns only non-suppressed triggers.
 pub fn filter_and_persist_triggers(
     db: &YantrikDB,
     triggers: Vec<Trigger>,
     ts: f64,
 ) -> Result<Vec<Trigger>> {
+    let triggers = drop_cross_namespace_triggers(db, triggers);
     let mut persisted = Vec::new();
     for t in triggers {
         if persist_trigger(db, &t, ts)?.is_some() {
